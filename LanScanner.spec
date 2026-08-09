@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['scan_lan.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('oui_vendor.zlib', '.'), ('app_icon.ico', '.')],
+    datas=[('oui_vendor.zlib', '.'), ('app_icon.ico', '.'), ('app_icon.png', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
