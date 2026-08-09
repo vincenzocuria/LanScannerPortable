@@ -1,4 +1,4 @@
-# LanScanner — Network Scanner Portatile per Windows
+# LanScanner v1.3.0 — Network Scanner Portatile per Windows
 
 **LanScanner** è uno strumento leggero, veloce e moderno per la scansione ed esplorazione degli host attivi sulla rete locale (LAN IPv4).
 
@@ -6,29 +6,26 @@ Realizzato in Python con interfaccia grafica **PySide6 (Qt 6)** e design **Mater
 
 ---
 
-## 🎨 Caratteristiche Principali
+## 🎨 Caratteristiche Principali (v1.3.0)
 
 - **Interfaccia Grafica Material 3 Expressive**:
   - TopBar moderna con logo icona, chip versione, pulsanti ad azione rapida e badge sviluppatore.
   - **Commutazione Temi Dinamica**: Tema **Chiaro (☀️)**, **Scuro (🌙)** e **Automatico (💻)** sincronizzato con le impostazioni di sistema di Windows.
-- **Scansione LAN Multithreaded ad Alta Velocità**:
-  - Rilevamento automatico subnet locale.
-  - Scansione parallela mediante socket ping / ICMP con avanzamento in tempo reale.
-- **Identificazione Dispositivi & Vendor OUI**:
-  - Estrazione automatica della tabella ARP di Windows.
+- **Scansione ICMP Nativa ad Altissima Velocità**:
+  - Utilizzo diretto delle API native di Windows (`IcmpSendEcho` via `ctypes`) per una velocità fino a 10 volte superiore.
+  - Rilevamento automatico della subnet locale ed avviso di eventuali conflitti IP / MAC duplicati.
+  - **Supporto Notazione CIDR e Calcolatore Subnet**: Inserimento diretto di notazioni come `192.168.1.0/24` e strumento di calcolo subnet integrato.
+- **Service Discovery & Protocolli Avanzati**:
+  - **Risoluzione mDNS / Bonjour (`.local`)** e **SSDP / UPnP Multicast Probe** per identificare automaticamente Smart TV, NAS Synology/QNAP, dispositivi IoT e stampanti.
   - Lookup istantaneo dei produttori hardware (Vendor) tramite database IEEE OUI integrato (compresso zlib).
-  - Risoluzione Hostname (Reverse DNS) e indizio tipologia dispositivo (PC, Mobile, VM, IoT, Stampante).
-- **Analisi Dettagliata Dispositivo**:
-  - Sondaggio NetBIOS (`nbtstat -A`).
-  - Scansione rapida delle porte TCP comuni (HTTP, HTTPS, SMB, SSH, RTSP, JetDirect).
-  - Copia automatica del report di diagnosi.
-- **Ricerca Aggiornamenti integrata**:
-  - Thread in background che interroga le API di GitHub Releases per notificare la disponibilità di nuove versioni.
-- **Esportazione & Stampa**:
-  - Esportazione dei risultati in formato **CSV** (con codifica UTF-8 BOM compatibile con Microsoft Excel).
+- **Diagnostica & Strumenti Integrati**:
+  - **Custom Port Scanner & Banner Grabbing**: Scansione di range di porte personalizzabili con lettura delle intestazioni di risposta dei servizi (HTTP, SSH, ecc.).
+  - **Rilevatore Rotta Traceroute**: Visualizzazione grafica del percorso di rete hop-by-hop.
+  - **Note Utente Personalizzate**: Possibilità di assegnare etichette e note agli indirizzi IP/MAC salvate localmente.
+  - Sondaggio NetBIOS (`nbtstat -A`), Ping Continuo RTT con statistiche, avvio RDP, SSH, SMB, HTTP/HTTPS e pacchetti **Wake-on-LAN (WoL)**.
+- **Esportazione Multi-Formato & Stampa**:
+  - Esportazione dei risultati in **CSV** (con UTF-8 BOM compatibile con Excel), **JSON** e **Report HTML Interattivo** con barra di ricerca integrata.
   - Generazione e stampa di report cartacei o PDF.
-- **File & Intervalli Recenti**:
-  - Salvataggio automatico degli ultimi intervalli IP scansionati tramite `QSettings`.
 
 ---
 
@@ -46,7 +43,7 @@ python build_exe.py
 ```
 
 ### 3. Generazione dell'Installer Windows (Inno Setup)
-Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.2.0.exe`.
+Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.3.0.exe`.
 
 ---
 

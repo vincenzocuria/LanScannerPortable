@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import csv
+import ctypes
 import ipaddress
 import json
 import os
 import pathlib
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -63,6 +65,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -71,6 +74,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -86,15 +90,15 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "LanScanner"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_COMPANY = "NGV Group S.R.L."
 APP_DEVELOPER = "Vincenzo Curia"
 GITHUB_REPO = "vincenzocuria/LanScannerPortable"
 WEBSITE_URL = "https://vcuria.app"
 
-COLS = ("ip", "ping", "mac", "vendor", "host", "hint")
-COL_HEADERS = ["IP", "Stato Ping / Rilevamento", "MAC", "Vendor (OUI)", "Hostname", "Indizio Dispositivo"]
-COL_WIDTHS = [130, 160, 140, 210, 210, 150]
+COLS = ("ip", "ping", "mac", "vendor", "host", "hint", "note")
+COL_HEADERS = ["IP", "Stato Ping / Rilevamento", "MAC", "Vendor (OUI)", "Hostname", "Indizio / Tipo", "Note Utente"]
+COL_WIDTHS = [125, 165, 140, 190, 190, 160, 150]
 
 _OUI_LOCK = threading.Lock()
 _OUI_MAP: Optional[Dict[str, str]] = None
@@ -150,21 +154,28 @@ def _vendor_from_mac(mac: str) -> str:
     return _load_oui_map().get("".join(parts[:3]), "")
 
 
-def _quick_hint(hostname: str, vendor: str, mac: str) -> str:
+def _quick_hint(hostname: str, vendor: str, mac: str, mdns: str = "", ssdp: str = "") -> str:
     h = (hostname or "").lower()
     v = (vendor or "").lower()
+    m_info = (mdns or "").lower()
+    s_info = (ssdp or "").lower()
     if h in ("", "—", "..."):
         h = ""
+
     hints: List[str] = []
+
+    if ssdp:
+        hints.append(f"UPnP: {ssdp[:24]}")
+
     if "vmware" in v or "virtualbox" in v or "pcs systemtechnik" in v:
         hints.append("VM")
-    if "raspberry" in v or "espressif" in v:
+    if "raspberry" in v or "espressif" in v or "esp32" in m_info:
         hints.append("SBC/IoT")
-    if "apple" in v or "iphone" in h or "ipad" in h:
+    if "apple" in v or "iphone" in h or "ipad" in h or "macbook" in h:
         hints.append("Apple?")
-    if "samsung" in v or "xiaomi" in v or "oneplus" in v:
+    if "samsung" in v or "xiaomi" in v or "oneplus" in v or "tizen" in s_info:
         hints.append("Mobile/TV?")
-    if "amazon" in v or "ech" in h:
+    if "amazon" in v or "echo" in h or "firetv" in h:
         hints.append("Amazon/IoT?")
     if "philips" in v or "hue" in h:
         hints.append("Hue/IoT?")
@@ -172,10 +183,13 @@ def _quick_hint(hostname: str, vendor: str, mac: str) -> str:
         hints.append("PC Windows?")
     if "android" in h:
         hints.append("Android?")
-    if "chromecast" in h or "gw-" in h:
+    if "chromecast" in h or "gw-" in h or "googlecast" in m_info:
         hints.append("Google Cast?")
-    if "printer" in h or "print" in h:
+    if "printer" in h or "print" in h or "ipp" in m_info:
         hints.append("Stampante?")
+    if "synology" in v or "qnap" in v or "diskstation" in h:
+        hints.append("NAS Storage?")
+
     if not hints and mac and mac != "—":
         try:
             parts = mac.upper().replace("-", ":").split(":")
@@ -183,6 +197,7 @@ def _quick_hint(hostname: str, vendor: str, mac: str) -> str:
                 hints.append("MAC locale (random)")
         except (ValueError, IndexError):
             pass
+
     return " · ".join(dict.fromkeys(hints)) if hints else "—"
 
 
@@ -244,15 +259,23 @@ def _default_range() -> Tuple[str, str]:
     return _default_range_for_ip(_local_ipv4() or "")
 
 
-def _iter_ipv4(start: str, end: str) -> List[str]:
-    a, b = ipaddress.IPv4Address(start.strip()), ipaddress.IPv4Address(end.strip())
+def _parse_ip_input(start_ip: str, end_ip: str) -> List[str]:
+    """Interpreta l'input sia in sintassi CIDR (es. 192.168.1.0/24) che range (192.168.1.1 - 254)."""
+    s = start_ip.strip()
+    e = end_ip.strip()
+
+    if "/" in s:
+        net = ipaddress.IPv4Network(s, strict=False)
+        return [str(h) for h in net.hosts()]
+
+    a, b = ipaddress.IPv4Address(s), ipaddress.IPv4Address(e)
     if int(a) > int(b):
         a, b = b, a
     return [str(ipaddress.IPv4Address(i)) for i in range(int(a), int(b) + 1)]
 
 
-def _ping_one(ip: str, timeout_ms: int) -> Tuple[bool, float]:
-    """Effettua un ping ICMP e restituisce (successo, tempo_rtt_ms)."""
+def _ping_subprocess(ip: str, timeout_ms: int) -> Tuple[bool, float]:
+    """Ping ICMP fallback tramite subprocess ping.exe."""
     t0 = time.perf_counter()
     try:
         cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -271,7 +294,6 @@ def _ping_one(ip: str, timeout_ms: int) -> Tuple[bool, float]:
 
         out = (r.stdout or "") + (r.stderr or "")
         if "TTL=" in out.upper():
-            # Cerca il valore preciso di tempo RTT se presente nell'output
             m = re.search(r"(?:durata|tempo|time)[=<](\d+)ms", out, re.IGNORECASE)
             if m:
                 return True, float(m.group(1))
@@ -279,6 +301,44 @@ def _ping_one(ip: str, timeout_ms: int) -> Tuple[bool, float]:
         return False, 0.0
     except (OSError, subprocess.TimeoutExpired):
         return False, 0.0
+
+
+def _ping_one(ip: str, timeout_ms: int = 750) -> Tuple[bool, float]:
+    """Effettua un ping ICMP nativo ad alta velocità via Windows IcmpSendEcho API (ctypes).
+    Passa automaticamente al fallback subprocess ping.exe se l'API non è disponibile.
+    """
+    if sys.platform == "win32":
+        try:
+            iphlpapi = ctypes.windll.iphlpapi
+            icmp = iphlpapi.IcmpCreateFile()
+            if icmp and icmp != -1 and icmp != 0xFFFFFFFF:
+                send_data = b"LanScannerPing"
+                reply_size = 32 + len(send_data) + 32
+                reply_buffer = ctypes.create_string_buffer(reply_size)
+
+                dest_ip = ctypes.c_ulong(socket.ntohl(struct.unpack("!I", socket.inet_aton(ip))[0]))
+
+                res = iphlpapi.IcmpSendEcho(
+                    icmp,
+                    dest_ip,
+                    send_data,
+                    len(send_data),
+                    None,
+                    reply_buffer,
+                    reply_size,
+                    timeout_ms,
+                )
+                iphlpapi.IcmpCloseHandle(icmp)
+
+                if res > 0:
+                    status = struct.unpack_from("<I", reply_buffer.raw, 4)[0]
+                    rtt_ms = struct.unpack_from("<I", reply_buffer.raw, 8)[0]
+                    if status == 0:  # IP_SUCCESS
+                        return True, float(rtt_ms)
+        except Exception:
+            pass
+
+    return _ping_subprocess(ip, timeout_ms)
 
 
 _ARP_REGEX = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})")
@@ -298,6 +358,7 @@ def _arp_map() -> Dict[str, str]:
         )
     except (OSError, subprocess.TimeoutExpired):
         return {}
+
     m: Dict[str, str] = {}
     for line in (r.stdout or "").splitlines():
         for x in _ARP_REGEX.finditer(line):
@@ -330,6 +391,61 @@ def _resolve_hostname(ip: str) -> str:
         return ""
 
 
+def _resolve_mdns_name(ip: str, timeout: float = 0.4) -> str:
+    """Sonda le risposte mDNS su UDP 5353 (.local domain)."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return ""
+        rev_ip = ".".join(reversed(parts)) + ".in-addr.arpa"
+        query = b"\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        for label in rev_ip.split("."):
+            query += bytes([len(label)]) + label.encode("ascii")
+        query += b"\x00\x00\x0c\x00\x01"
+
+        sock.sendto(query, (ip, 5353))
+        data, _ = sock.recvfrom(1024)
+        sock.close()
+
+        if len(data) > 12:
+            # Parse basic string labels from mDNS answer
+            labels = re.findall(rb"[\x01-\x30]([a-zA-Z0-9\-_]{2,30})", data)
+            valid = [l.decode("ascii", errors="ignore") for l in labels if l.lower() not in (b"in-addr", b"arpa", b"local")]
+            if valid:
+                return f"{valid[0]}.local"
+    except Exception:
+        pass
+    return ""
+
+
+def _probe_ssdp_info(ip: str, timeout: float = 0.5) -> str:
+    """Sonda l'header SSDP UPnP (UDP 1900)."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        req = (
+            "M-SEARCH * HTTP/1.1\r\n"
+            f"HOST: {ip}:1900\r\n"
+            'MAN: "ssdp:discover"\r\n'
+            "MX: 1\r\n"
+            "ST: ssdp:all\r\n\r\n"
+        ).encode("utf-8")
+        sock.sendto(req, (ip, 1900))
+        data, _ = sock.recvfrom(2048)
+        sock.close()
+        text = data.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            if line.lower().startswith("server:"):
+                return line.split(":", 1)[1].strip()
+            elif line.lower().startswith("location:"):
+                return f"UPnP ({line.split(':', 1)[1].strip()})"
+    except Exception:
+        pass
+    return ""
+
+
 def _nbtstat(ip: str) -> str:
     try:
         cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -347,27 +463,38 @@ def _nbtstat(ip: str) -> str:
         return "(nbtstat non disponibile o timeout)"
 
 
-def _probe_ports(ip: str, ports: List[Tuple[int, str]], timeout: float = 0.35) -> List[str]:
-    out = []
+def _probe_ports_with_banner(ip: str, ports: List[Tuple[int, str]], timeout: float = 0.35) -> List[Tuple[int, str, str]]:
+    """Sonda una lista di porte TCP con estrazione del banner di risposta."""
+    results = []
     for port, label in ports:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
             if s.connect_ex((ip, port)) == 0:
-                out.append(f"{port} ({label})")
+                banner = ""
+                try:
+                    if port in (80, 8080, 5000):
+                        s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+                    data = s.recv(256)
+                    first = data.decode("utf-8", errors="replace").splitlines()
+                    if first:
+                        banner = first[0].strip()[:50]
+                except Exception:
+                    pass
+                results.append((port, label, banner))
         except OSError:
             pass
         finally:
             s.close()
-    return out
+    return results
 
 
 # --- BACKGROUND THREADS ---
 
 class UpdateCheckerThread(QThread):
-    update_found = Signal(str, str, str)     # tag_version, download_url, release_notes
-    no_update_found = Signal(str)            # current_version
-    check_failed = Signal(str)               # error_message
+    update_found = Signal(str, str, str)
+    no_update_found = Signal(str)
+    check_failed = Signal(str)
 
     def __init__(self, current_version: str = APP_VERSION, parent=None):
         super().__init__(parent)
@@ -401,28 +528,8 @@ class UpdateCheckerThread(QThread):
                 return
             self.check_failed.emit(f"HTTP Error {e.code}")
             return
-        except Exception:
-            try:
-                tags_url = f"https://api.github.com/repos/{GITHUB_REPO}/tags"
-                req = urllib.request.Request(tags_url, headers=headers)
-                with urllib.request.urlopen(req, timeout=6) as response:
-                    if response.status == 200:
-                        tags = json.loads(response.read().decode("utf-8"))
-                        if tags and isinstance(tags, list):
-                            tag_name = tags[0].get("name", "").strip()
-                            latest_ver = tag_name.lstrip("v")
-                            html_url = f"https://github.com/{GITHUB_REPO}/releases"
-                            if self._is_newer(latest_ver, self.current_version):
-                                self.update_found.emit(tag_name, html_url, "")
-                                return
-                            else:
-                                self.no_update_found.emit(self.current_version)
-                                return
-            except Exception as ex:
-                self.check_failed.emit(str(ex))
-                return
-
-            self.no_update_found.emit(self.current_version)
+        except Exception as ex:
+            self.check_failed.emit(str(ex))
             return
 
     @staticmethod
@@ -435,7 +542,7 @@ class UpdateCheckerThread(QThread):
 
 
 class ContinuousPingWorker(QThread):
-    ping_result = Signal(bool, float, str)  # success, rtt_ms, timestamp_str
+    ping_result = Signal(bool, float, str)
 
     def __init__(self, ip: str, interval_sec: float = 1.0, parent=None):
         super().__init__(parent)
@@ -454,17 +561,64 @@ class ContinuousPingWorker(QThread):
             time.sleep(self.interval_sec)
 
 
+class TracerouteWorker(QThread):
+    hop_found = Signal(int, str, float, str)
+    finished = Signal()
+
+    def __init__(self, target_ip: str, max_hops: int = 30, parent=None):
+        super().__init__(parent)
+        self.target_ip = target_ip
+        self.max_hops = max_hops
+        self._running = True
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        try:
+            cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            p = subprocess.Popen(
+                ["tracert", "-d", "-h", str(self.max_hops), "-w", "750", self.target_ip],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="cp850",
+                errors="replace",
+                creationflags=cr,
+            )
+            for line in iter(p.stdout.readline, ""):
+                if not self._running:
+                    p.terminate()
+                    break
+                line_str = line.strip()
+                m = re.search(r"^\s*(\d+)\s+([\d\s<ms\*]+)\s+(\d{1,3}(?:\.\d{1,3}){3})", line_str)
+                if m:
+                    hop = int(m.group(1))
+                    rtt_raw = m.group(2)
+                    ip = m.group(3)
+                    rtts = re.findall(r"(\d+)\s*ms", rtt_raw)
+                    avg_rtt = float(rtts[0]) if rtts else 0.0
+                    hn = _resolve_hostname(ip)
+                    self.hop_found.emit(hop, ip, avg_rtt, hn)
+                    if ip == self.target_ip:
+                        break
+        except Exception:
+            pass
+        self.finished.emit()
+
+
 class ScanWorkerThread(QThread):
-    progress_updated = Signal(int, int)       # done, total
-    initial_alive_found = Signal(list)        # list of alive tuples (ip, status_str, mac, vendor, "...", hint)
-    hostname_resolved = Signal(str, str, str) # ip, hostname, hint
-    scan_finished = Signal(int)              # total_alive_count
+    progress_updated = Signal(int, int)
+    initial_alive_found = Signal(list)
+    hostname_resolved = Signal(str, str, str, str)  # ip, hostname, hint, note
+    scan_finished = Signal(int)
     scan_interrupted = Signal()
     scan_error = Signal(str)
 
-    def __init__(self, hosts: List[str], max_workers: int = 48, parent=None):
+    def __init__(self, hosts: List[str], device_notes: Dict[str, str], max_workers: int = 64, parent=None):
         super().__init__(parent)
         self.hosts = hosts
+        self.device_notes = device_notes
         self.max_workers = max_workers
         self._cancel_event = threading.Event()
 
@@ -479,11 +633,9 @@ class ScanWorkerThread(QThread):
 
         try:
             _load_oui_map()
-
-            # 1. Rileva subito la tabella ARP esistente di sistema
             initial_arp = _arp_map()
 
-            # 2. Esegui la scansione ICMP Ping parallela
+            # Scansione ICMP Ping nativa parallela
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as ex:
                 futs = {ex.submit(_ping_one, ip, timeout_ms): ip for ip in self.hosts}
                 for fu in concurrent.futures.as_completed(futs):
@@ -503,43 +655,51 @@ class ScanWorkerThread(QThread):
                 self.scan_interrupted.emit()
                 return
 
-            # 3. Aggiorna la tabella ARP post-ping per identificare tutti gli host attivi (anche quelli con ICMP bloccato!)
-            time.sleep(0.3)
+            time.sleep(0.2)
             post_arp = _arp_map()
             combined_arp = {**initial_arp, **post_arp}
 
-            rows: List[Tuple[str, str, str, str, str, str]] = []
-            alive_ips: List[str] = []
+            # Controlla conflitti MAC (stesso MAC per piu IP o viceversa)
+            mac_counts: Dict[str, int] = {}
+            for m in combined_arp.values():
+                if m and m != "—":
+                    mac_counts[m] = mac_counts.get(m, 0) + 1
+
+            rows: List[Tuple[str, str, str, str, str, str, str]] = []
 
             for ip in self.hosts:
                 ok, rtt = ping_results.get(ip, (False, 0.0))
                 mac = combined_arp.get(ip, "")
+                note = self.device_notes.get(mac, self.device_notes.get(ip, ""))
 
                 if ok:
-                    alive_ips.append(ip)
                     status_str = f"🟢 Attivo ({int(rtt)} ms)" if rtt > 0 else "🟢 Attivo"
                     v = _vendor_from_mac(mac) if mac else ""
-                    rows.append((ip, status_str, mac or "—", v or "—", "...", "—"))
+                    rows.append((ip, status_str, mac or "—", v or "—", "...", "—", note or "—"))
                 elif mac and mac != "—":
-                    # Dispositivo presente nella tabella ARP ma che blocca il Ping ICMP (es. firewall attivo)
-                    alive_ips.append(ip)
                     status_str = "🟡 Risponde ARP (Firewall)"
                     v = _vendor_from_mac(mac)
-                    rows.append((ip, status_str, mac, v or "—", "...", "—"))
+                    rows.append((ip, status_str, mac, v or "—", "...", "—", note or "—"))
 
             sorted_rows = sorted(rows, key=lambda x: int(ipaddress.IPv4Address(x[0])))
             self.initial_alive_found.emit(sorted_rows)
 
-            # 4. Risoluzione Hostname e Hint in background
+            # Risoluzione Hostname, mDNS, SSDP ed Hint
             sorted_ips = [r[0] for r in sorted_rows]
             for ip in sorted_ips:
                 if self._cancel_event.is_set():
                     break
                 mac = combined_arp.get(ip, "")
                 v = _vendor_from_mac(mac) if mac else ""
-                hn = _resolve_hostname(ip) or "—"
-                hint = _quick_hint(hn, v, mac)
-                self.hostname_resolved.emit(ip, hn, hint)
+                hn = _resolve_hostname(ip) or ""
+                mdns_name = _resolve_mdns_name(ip) if not hn else ""
+                ssdp_info = _probe_ssdp_info(ip) if not hn and not mdns_name else ""
+
+                disp_hn = hn or mdns_name or "—"
+                hint = _quick_hint(disp_hn, v, mac, mdns_name, ssdp_info)
+                note = self.device_notes.get(mac, self.device_notes.get(ip, "—"))
+
+                self.hostname_resolved.emit(ip, disp_hn, hint, note)
 
             if self._cancel_event.is_set():
                 self.scan_interrupted.emit()
@@ -552,6 +712,242 @@ class ScanWorkerThread(QThread):
 
 
 # --- DIALOGS & TOOLS ---
+
+class SubnetCalculatorDialog(QDialog):
+    """Calcolatore Subnet / Notazione CIDR e suddivisione IP."""
+
+    def __init__(self, cidr_or_ip: str = "192.168.1.0/24", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calcolatore Subnet & Notazione CIDR")
+        self.setFixedSize(500, 360)
+        _set_window_icon(self)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        lbl_hdr = QLabel("🌐 Analisi Subnet IPv4")
+        lbl_hdr.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        layout.addWidget(lbl_hdr)
+
+        form_lay = QHBoxLayout()
+        self.txt_cidr = QLineEdit(cidr_or_ip)
+        self.txt_cidr.setFont(QFont("Consolas", 10, QFont.Bold))
+        btn_calc = QPushButton("⚡ Calcola")
+        btn_calc.setObjectName("PrimaryBtn")
+        btn_calc.setCursor(Qt.PointingHandCursor)
+        btn_calc.clicked.connect(self._calculate)
+
+        form_lay.addWidget(QLabel("Indirizzo CIDR:"))
+        form_lay.addWidget(self.txt_cidr)
+        form_lay.addWidget(btn_calc)
+        layout.addLayout(form_lay)
+
+        self.txt_info = QTextEdit()
+        self.txt_info.setReadOnly(True)
+        self.txt_info.setFont(QFont("Consolas", 9.5))
+        layout.addWidget(self.txt_info)
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.setObjectName("SecondaryBtn")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close, alignment=Qt.AlignRight)
+
+        self._calculate()
+
+    def _calculate(self) -> None:
+        raw = self.txt_cidr.text().strip()
+        try:
+            if "/" not in raw:
+                raw += "/24"
+            net = ipaddress.IPv4Network(raw, strict=False)
+            hosts = list(net.hosts())
+            first_host = str(hosts[0]) if hosts else "N/A"
+            last_host = str(hosts[-1]) if hosts else "N/A"
+
+            info = [
+                f"Rete CIDR:           {net.with_prefixlen}",
+                f"Maschera Subnet:     {net.netmask}",
+                f"Indirizzo Rete:      {net.network_address}",
+                f"Indirizzo Broadcast: {net.broadcast_address}",
+                f"Host Utili Totali:   {net.num_addresses - 2 if net.prefixlen <= 30 else net.num_addresses}",
+                f"Primo Host Utile:    {first_host}",
+                f"Ultimo Host Utile:   {last_host}",
+                f"Tipo Indirizzo:      {'Privato (LAN)' if net.is_private else 'Pubblico (WAN)'}",
+            ]
+            self.txt_info.setText("\n".join(info))
+        except Exception as e:
+            self.txt_info.setText(f"Errore calcolo subnet: {e}")
+
+
+class CustomPortScanDialog(QDialog):
+    """Scansione porte TCP avanzata e personalizzabile con Banner Grabbing."""
+
+    PORTS_DEFAULT = [
+        (80, "HTTP Web Server"),
+        (443, "HTTPS Sec Web"),
+        (445, "SMB File Share"),
+        (22, "SSH Terminal"),
+        (21, "FTP Transfer"),
+        (23, "Telnet Remote"),
+        (53, "DNS Service"),
+        (3389, "RDP Remote Desktop"),
+        (5900, "VNC Remote Desktop"),
+        (8080, "HTTP Alt Proxy"),
+        (8443, "HTTPS Alt"),
+        (5000, "UPnP / Synology"),
+        (9100, "JetDirect Print"),
+    ]
+
+    def __init__(self, target_ip: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Scansione Porte Personalizzata — {target_ip}")
+        self.resize(600, 450)
+        _set_window_icon(self)
+        self.target_ip = target_ip
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
+
+        hdr_box = QHBoxLayout()
+        lbl_target = QLabel(f"🎯 Target: <b>{target_ip}</b>")
+        lbl_target.setFont(QFont("Segoe UI", 11))
+        hdr_box.addWidget(lbl_target)
+
+        self.txt_ports = QLineEdit("80, 443, 445, 22, 21, 23, 53, 3389, 5900, 8080, 8443, 5000, 9100")
+        self.txt_ports.setFont(QFont("Consolas", 9.5))
+        hdr_box.addWidget(QLabel("Porte da testare:"))
+        hdr_box.addWidget(self.txt_ports)
+
+        btn_scan = QPushButton("🔍 Avvia Scan")
+        btn_scan.setObjectName("PrimaryBtn")
+        btn_scan.setCursor(Qt.PointingHandCursor)
+        btn_scan.clicked.connect(self._run_scan)
+        hdr_box.addWidget(btn_scan)
+
+        layout.addLayout(hdr_box)
+
+        self.txt_results = QTextEdit()
+        self.txt_results.setReadOnly(True)
+        self.txt_results.setFont(QFont("Consolas", 9.5))
+        layout.addWidget(self.txt_results)
+
+        btn_box = QHBoxLayout()
+        btn_copy = QPushButton("📋 Copia Risultati")
+        btn_copy.setObjectName("SecondaryBtn")
+        btn_copy.setCursor(Qt.PointingHandCursor)
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(self.txt_results.toPlainText()))
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.setObjectName("SecondaryBtn")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.clicked.connect(self.accept)
+
+        btn_box.addWidget(btn_copy)
+        btn_box.addStretch()
+        btn_box.addWidget(btn_close)
+        layout.addLayout(btn_box)
+
+        self._run_scan()
+
+    def _run_scan(self) -> None:
+        self.txt_results.setText("Scansione porte e lettura banner in corso...")
+        raw_ports = self.txt_ports.text()
+
+        def parse_ports(txt: str) -> List[Tuple[int, str]]:
+            p_list: List[Tuple[int, str]] = []
+            for part in txt.split(","):
+                part = part.strip()
+                if "-" in part:
+                    try:
+                        s_p, e_p = map(int, part.split("-"))
+                        for p in range(s_p, min(e_p + 1, 65535)):
+                            p_list.append((p, f"Porta {p}"))
+                    except ValueError:
+                        pass
+                elif part.isdigit():
+                    p = int(part)
+                    p_list.append((p, f"Porta {p}"))
+            return p_list or self.PORTS_DEFAULT
+
+        ports_to_scan = parse_ports(raw_ports)
+
+        def job() -> None:
+            open_found = _probe_ports_with_banner(self.target_ip, ports_to_scan)
+            lines = [f"=== SCANSIONE PORTE TCP SU {self.target_ip} ===\n\n"]
+            if open_found:
+                for port, label, banner in open_found:
+                    b_str = f" → Banner: [{banner}]" if banner else ""
+                    lines.append(f"🟢 Porta {port:<5} OPEN ({label}){b_str}\n")
+            else:
+                lines.append("❌ Nessuna porta aperta trovata tra quelle modificate.\n")
+            report = "".join(lines)
+            QTimer.singleShot(0, lambda: self.txt_results.setText(report))
+
+        threading.Thread(target=job, daemon=True).start()
+
+
+class TracerouteDialog(QDialog):
+    """Traceroute grafico con avanzamento hop-by-hop."""
+
+    def __init__(self, target_ip: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Traceroute — Rotta verso {target_ip}")
+        self.resize(580, 420)
+        _set_window_icon(self)
+        self.target_ip = target_ip
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
+
+        layout.addWidget(QLabel(f"🛤️ Analisi percorso di rete (IP Hop) verso <b>{target_ip}</b>:"))
+
+        self.table = QTreeWidget()
+        self.table.setHeaderLabels(["Hop #", "Indirizzo IP", "Latenza RTT", "Hostname / Nodo"])
+        self.table.setColumnWidth(0, 60)
+        self.table.setColumnWidth(1, 140)
+        self.table.setColumnWidth(2, 110)
+        self.table.header().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+        btn_box = QHBoxLayout()
+        self.btn_toggle = QPushButton("🛑 Interrompi")
+        self.btn_toggle.setObjectName("SecondaryBtn")
+        self.btn_toggle.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle.clicked.connect(self._stop_trace)
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.setObjectName("PrimaryBtn")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.clicked.connect(self.accept)
+
+        btn_box.addWidget(self.btn_toggle)
+        btn_box.addStretch()
+        btn_box.addWidget(btn_close)
+        layout.addLayout(btn_box)
+
+        self.worker = TracerouteWorker(target_ip, parent=self)
+        self.worker.hop_found.connect(self._on_hop_found)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.start()
+
+    def _on_hop_found(self, hop: int, ip: str, rtt: float, hostname: str) -> None:
+        rtt_str = f"{rtt:.1f} ms" if rtt > 0 else "<1 ms"
+        item = QTreeWidgetItem(self.table, [str(hop), ip, rtt_str, hostname or "—"])
+        item.setTextAlignment(0, Qt.AlignCenter)
+
+    def _on_finished(self) -> None:
+        self.btn_toggle.setEnabled(False)
+        self.btn_toggle.setText("Completato")
+
+    def _stop_trace(self) -> None:
+        if self.worker.isRunning():
+            self.worker.stop()
+            self.btn_toggle.setText("Interrotto")
+
 
 class ContinuousPingDialog(QDialog):
     """Finestra di monitoraggio continuo latenza Ping RTT per un dispositivo."""
@@ -571,7 +967,6 @@ class ContinuousPingDialog(QDialog):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
-        # Header Cards
         hdr_frame = QHBoxLayout()
         hdr_frame.setSpacing(10)
 
@@ -588,13 +983,11 @@ class ContinuousPingDialog(QDialog):
 
         layout.addLayout(hdr_frame)
 
-        # Log Text Box
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setFont(QFont("Consolas", 9.5))
         layout.addWidget(self.txt_log)
 
-        # Actions Row
         btn_box = QHBoxLayout()
         self.btn_toggle = QPushButton("⏸️ Pausa")
         self.btn_toggle.setObjectName("SecondaryBtn")
@@ -617,7 +1010,6 @@ class ContinuousPingDialog(QDialog):
         btn_box.addWidget(btn_close)
         layout.addLayout(btn_box)
 
-        # Worker launch
         self.worker = ContinuousPingWorker(target_ip, interval_sec=1.0, parent=self)
         self.worker.ping_result.connect(self._on_ping_result)
         self.worker.start()
@@ -632,7 +1024,6 @@ class ContinuousPingDialog(QDialog):
         else:
             self.txt_log.append(f"[{now_str}] Richiesta scaduta per {self.target_ip} (Timeout)")
 
-        # Update stats
         loss_pct = round(((self.sent_count - self.recv_count) / self.sent_count) * 100, 1)
         avg_rtt = round(sum(self.rtt_list) / len(self.rtt_list), 1) if self.rtt_list else 0.0
 
@@ -661,11 +1052,122 @@ class ContinuousPingDialog(QDialog):
         super().closeEvent(event)
 
 
+class DeviceDetailDialog(QDialog):
+    PORTS = CustomPortScanDialog.PORTS_DEFAULT
+
+    def __init__(self, ip: str, row_values: Tuple[str, ...], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Dettaglio Dispositivo — {ip}")
+        self.resize(660, 520)
+        _set_window_icon(self)
+        self._ip = ip
+        self._row = row_values
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(4)
+
+        def add_info(lbl_text, val_text, row, col):
+            l = QLabel(f"<b>{lbl_text}:</b>")
+            v = QLabel(str(val_text or "—"))
+            grid.addWidget(l, row, col * 2)
+            grid.addWidget(v, row, col * 2 + 1)
+
+        add_info("Indirizzo IP", row_values[0] if len(row_values) > 0 else ip, 0, 0)
+        add_info("Stato Ping", row_values[1] if len(row_values) > 1 else "-", 0, 1)
+        add_info("Indirizzo MAC", row_values[2] if len(row_values) > 2 else "-", 1, 0)
+        add_info("Vendor OUI", row_values[3] if len(row_values) > 3 else "-", 1, 1)
+        add_info("Hostname", row_values[4] if len(row_values) > 4 else "-", 2, 0)
+        add_info("Indizio / Tipo", row_values[5] if len(row_values) > 5 else "-", 2, 1)
+        if len(row_values) > 6:
+            add_info("Note Utente", row_values[6], 3, 0)
+
+        layout.addLayout(grid)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setObjectName("HorizontalSeparator")
+        layout.addWidget(sep)
+
+        lbl_report = QLabel("📜 Report di Analisi Avanzata (mDNS + SSDP + NetBIOS + Porte TCP):")
+        lbl_report.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        layout.addWidget(lbl_report)
+
+        self.txt_report = QTextEdit()
+        self.txt_report.setReadOnly(True)
+        self.txt_report.setFont(QFont("Consolas", 9.5))
+        layout.addWidget(self.txt_report)
+
+        btn_box = QHBoxLayout()
+        btn_analyze = QPushButton("🔍 Analizza Dettagliatamente")
+        btn_analyze.setObjectName("PrimaryBtn")
+        btn_analyze.setCursor(Qt.PointingHandCursor)
+        btn_analyze.clicked.connect(self._start_analysis)
+
+        btn_copy = QPushButton("📋 Copia Report")
+        btn_copy.setObjectName("SecondaryBtn")
+        btn_copy.setCursor(Qt.PointingHandCursor)
+        btn_copy.clicked.connect(self._copy_report)
+
+        btn_close = QPushButton("Chiudi")
+        btn_close.setObjectName("SecondaryBtn")
+        btn_close.setCursor(Qt.PointingHandCursor)
+        btn_close.clicked.connect(self.accept)
+
+        btn_box.addWidget(btn_analyze)
+        btn_box.addWidget(btn_copy)
+        btn_box.addStretch()
+        btn_box.addWidget(btn_close)
+        layout.addLayout(btn_box)
+
+        self.txt_report.setText("Clicca su 'Analizza Dettagliatamente' per eseguire il sondaggio avanzato dei protocolli di rete.")
+
+    def _start_analysis(self) -> None:
+        self.txt_report.setText("Analisi avanzata in corso (mDNS + UPnP + NetBIOS + Porte)...\nAttendere qualche secondo...")
+
+        def job() -> None:
+            lines = [f"=== REPORT DETTAGLIATO DISPOSITIVO {self._ip} ===\n\n"]
+            hn = _resolve_hostname(self._ip)
+            mdns = _resolve_mdns_name(self._ip)
+            ssdp = _probe_ssdp_info(self._ip)
+
+            lines.append(f"Hostname (DNS Reverse): {hn or '—'}\n")
+            lines.append(f"Hostname mDNS (.local):  {mdns or '—'}\n")
+            lines.append(f"UPnP / SSDP Server:     {ssdp or '—'}\n\n")
+
+            lines.append("=== NetBIOS Name Service (nbtstat -A) ===\n")
+            lines.append(_nbtstat(self._ip) + "\n\n")
+
+            lines.append("=== Sondaggio Porte TCP Comuni con Banner ===\n")
+            openp = _probe_ports_with_banner(self._ip, self.PORTS)
+            if openp:
+                for p, lbl, b in openp:
+                    b_str = f" [{b}]" if b else ""
+                    lines.append(f"• Porta {p} ({lbl}){b_str}\n")
+            else:
+                lines.append("Nessuna delle porte standard testate risponde in apertura.\n")
+
+            lines.append("\n=== Note ===\n")
+            lines.append("Produttore hardware derivato dal database IEEE OUI. Eventuali firewall locali o di rete possono filtrare i pacchetti.\n")
+            report = "".join(lines)
+            QTimer.singleShot(0, lambda: self.txt_report.setText(report))
+
+        threading.Thread(target=job, daemon=True).start()
+
+    def _copy_report(self) -> None:
+        QApplication.clipboard().setText(self.txt_report.toPlainText())
+        QMessageBox.information(self, "Copia", "Report di dettaglio copiato negli appunti.")
+
+
 class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Informazioni su {APP_NAME}")
-        self.setFixedSize(500, 420)
+        self.setFixedSize(520, 440)
         _set_window_icon(self)
 
         layout = QVBoxLayout(self)
@@ -703,18 +1205,21 @@ class AboutDialog(QDialog):
             f"<b>Sviluppatore:</b> {APP_DEVELOPER}<br>"
             f"<b>Sito Web:</b> <a href='{WEBSITE_URL}'>{WEBSITE_URL}</a><br>"
             f"<b>Repository:</b> <a href='https://github.com/{GITHUB_REPO}'>GitHub Repository</a><br><br>"
-            "<b>Licenza & Note:</b><br>"
-            "Software gratuito distribuito ad uso libero per fini personali e commerciali, "
-            "senza alcuna garanzia e senza obbligo di assistenza.<br><br>"
-            "L'utente è unico responsabile dell'impiego conforme alle norme vigenti "
-            "e di operare esclusivamente su reti per le quali dispone di preventiva autorizzazione.<br><br>"
-            "<small><i>Database IEEE OUI derivato dal file manuf del progetto Wireshark.</i></small>"
+            "<b>Novità Versione 1.3.0:</b><br>"
+            "• Ping ICMP nativo ad alta velocità via Windows API (ctypes)<br>"
+            "• Notazione CIDR e Calcolatore Subnet incorporato<br>"
+            "• Discovery mDNS (.local) ed UPnP / SSDP per dispositivi IoT/Smart TV<br>"
+            "• Custom Port Scanner con estrazione dei banner TCP<br>"
+            "• Rilevatore rotta Traceroute graficamente integrato<br>"
+            "• Assegnazione Note Utente e salvataggio locale<br>"
+            "• Esportazione multi-formato in CSV, JSON ed HTML Interattivo<br><br>"
+            "<small><i>Database IEEE OUI derivato dal progetto Wireshark.</i></small>"
         )
 
         lbl_body = QLabel(body_text)
         lbl_body.setWordWrap(True)
         lbl_body.setOpenExternalLinks(True)
-        lbl_body.setFont(QFont("Segoe UI", 10))
+        lbl_body.setFont(QFont("Segoe UI", 9.5))
         layout.addWidget(lbl_body)
 
         layout.addStretch()
@@ -817,126 +1322,14 @@ class UpdateDialog(QDialog):
         self.accept()
 
 
-class DeviceDetailDialog(QDialog):
-    PORTS = [
-        (80, "HTTP Web"),
-        (443, "HTTPS Web Sec"),
-        (445, "SMB File Share"),
-        (22, "SSH Terminal"),
-        (21, "FTP File Transfer"),
-        (23, "Telnet"),
-        (53, "DNS Name Server"),
-        (3389, "RDP Remote Desktop"),
-        (554, "RTSP Camera"),
-        (9100, "JetDirect Stampa"),
-        (5000, "UPnP / Synology"),
-        (8080, "HTTP Alt"),
-    ]
-
-    def __init__(self, ip: str, row_values: Tuple[str, ...], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Dettaglio Dispositivo — {ip}")
-        self.resize(640, 500)
-        _set_window_icon(self)
-        self._ip = ip
-        self._row = row_values
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(4)
-
-        def add_info(lbl_text, val_text, row, col):
-            l = QLabel(f"<b>{lbl_text}:</b>")
-            v = QLabel(str(val_text or "—"))
-            grid.addWidget(l, row, col * 2)
-            grid.addWidget(v, row, col * 2 + 1)
-
-        add_info("Indirizzo IP", row_values[0] if len(row_values) > 0 else ip, 0, 0)
-        add_info("Stato Ping", row_values[1] if len(row_values) > 1 else "-", 0, 1)
-        add_info("Indirizzo MAC", row_values[2] if len(row_values) > 2 else "-", 1, 0)
-        add_info("Vendor OUI", row_values[3] if len(row_values) > 3 else "-", 1, 1)
-        add_info("Hostname", row_values[4] if len(row_values) > 4 else "-", 2, 0)
-        add_info("Indizio", row_values[5] if len(row_values) > 5 else "-", 2, 1)
-
-        layout.addLayout(grid)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setObjectName("HorizontalSeparator")
-        layout.addWidget(sep)
-
-        lbl_report = QLabel("📜 Report di Analisi Avanzata (NetBIOS + Porte TCP):")
-        lbl_report.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        layout.addWidget(lbl_report)
-
-        self.txt_report = QTextEdit()
-        self.txt_report.setReadOnly(True)
-        self.txt_report.setFont(QFont("Consolas", 9.5))
-        layout.addWidget(self.txt_report)
-
-        btn_box = QHBoxLayout()
-        btn_analyze = QPushButton("🔍 Analizza (NetBIOS + Porte)")
-        btn_analyze.setObjectName("PrimaryBtn")
-        btn_analyze.setCursor(Qt.PointingHandCursor)
-        btn_analyze.clicked.connect(self._start_analysis)
-
-        btn_copy = QPushButton("📋 Copia Report")
-        btn_copy.setObjectName("SecondaryBtn")
-        btn_copy.setCursor(Qt.PointingHandCursor)
-        btn_copy.clicked.connect(self._copy_report)
-
-        btn_close = QPushButton("Chiudi")
-        btn_close.setObjectName("SecondaryBtn")
-        btn_close.setCursor(Qt.PointingHandCursor)
-        btn_close.clicked.connect(self.accept)
-
-        btn_box.addWidget(btn_analyze)
-        btn_box.addWidget(btn_copy)
-        btn_box.addStretch()
-        btn_box.addWidget(btn_close)
-        layout.addLayout(btn_box)
-
-        self.txt_report.setText("Clicca su 'Analizza' per eseguire l'analisi NetBIOS e la scansione delle porte TCP principali.")
-
-    def _start_analysis(self) -> None:
-        self.txt_report.setText("Analisi avanzata in corso...\nAttendere qualche secondo...")
-
-        def job() -> None:
-            lines = [f"=== REPORT DETTAGLIATO DISPOSITIVO {self._ip} ===\n\n"]
-            hn = _resolve_hostname(self._ip)
-            lines.append(f"Hostname (DNS Reverse): {hn or '—'}\n\n")
-            lines.append("=== NetBIOS Name Service (nbtstat -A) ===\n")
-            lines.append(_nbtstat(self._ip) + "\n\n")
-            lines.append("=== Sondaggio Porte TCP Comuni ===\n")
-            openp = _probe_ports(self._ip, self.PORTS)
-            lines.append(
-                ", ".join(openp) if openp else "Nessuna delle porte standard testate risponde in apertura.\n"
-            )
-            lines.append("\n=== Nota ===\n")
-            lines.append("Vendor identificato tramite OUI IEEE. Eventuali firewall locali o di rete possono filtrare le risposte alle porte.\n")
-            report = "".join(lines)
-            QTimer.singleShot(0, lambda: self.txt_report.setText(report))
-
-        threading.Thread(target=job, daemon=True).start()
-
-    def _copy_report(self) -> None:
-        cb = QApplication.clipboard()
-        cb.setText(self.txt_report.toPlainText())
-        QMessageBox.information(self, "Copia", "Report di dettaglio copiato negli appunti.")
-
-
 # --- MAIN APPLICATION WINDOW ---
 
 class LanScannerWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — Material 3 Edition")
-        self.resize(1180, 700)
-        self.setMinimumSize(880, 520)
+        self.resize(1240, 720)
+        self.setMinimumSize(920, 540)
 
         _set_window_icon(self)
 
@@ -944,6 +1337,8 @@ class LanScannerWindow(QMainWindow):
         self.theme_mode = self.settings.value("theme_mode", "auto")
         self.scan_worker: Optional[ScanWorkerThread] = None
         self.update_checker: Optional[UpdateCheckerThread] = None
+
+        self._load_device_notes()
 
         self._create_menu_bar()
         self._init_ui()
@@ -953,13 +1348,23 @@ class LanScannerWindow(QMainWindow):
 
         QTimer.singleShot(2500, lambda: self.check_for_updates(manual=False))
 
+    def _load_device_notes(self) -> None:
+        raw = self.settings.value("device_notes", "{}")
+        try:
+            self.device_notes: Dict[str, str] = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception:
+            self.device_notes = {}
+
+    def _save_device_notes(self) -> None:
+        self.settings.setValue("device_notes", json.dumps(self.device_notes))
+
     # --- THEME ENGINE ---
     def _get_effective_theme(self) -> str:
         if self.theme_mode == "light":
             return "light"
         elif self.theme_mode == "dark":
             return "dark"
-        else:  # "auto"
+        else:
             try:
                 key = winreg.OpenKey(
                     winreg.HKEY_CURRENT_USER,
@@ -1037,10 +1442,18 @@ class LanScannerWindow(QMainWindow):
 
         menu_file.addSeparator()
 
-        self.act_export = QAction("💾 Esporta Risultati CSV...", self)
-        self.act_export.setShortcut(QKeySequence.Save)
-        self.act_export.triggered.connect(self._export_csv_dialog)
-        menu_file.addAction(self.act_export)
+        self.act_export_csv = QAction("💾 Esporta Risultati CSV...", self)
+        self.act_export_csv.setShortcut(QKeySequence.Save)
+        self.act_export_csv.triggered.connect(self._export_csv_dialog)
+        menu_file.addAction(self.act_export_csv)
+
+        self.act_export_json = QAction("📄 Esporta Risultati JSON...", self)
+        self.act_export_json.triggered.connect(self._export_json_dialog)
+        menu_file.addAction(self.act_export_json)
+
+        self.act_export_html = QAction("🌐 Esporta Report HTML Interattivo...", self)
+        self.act_export_html.triggered.connect(self._export_html_dialog)
+        menu_file.addAction(self.act_export_html)
 
         self.act_print = QAction("🖨️ Stampa Report...", self)
         self.act_print.setShortcut(QKeySequence.Print)
@@ -1080,6 +1493,10 @@ class LanScannerWindow(QMainWindow):
 
         menu_tools.addSeparator()
 
+        act_subnet_calc = QAction("🌐 Calcolatore Subnet / Notazione CIDR...", self)
+        act_subnet_calc.triggered.connect(self._open_subnet_calc)
+        menu_tools.addAction(act_subnet_calc)
+
         act_copy = QAction("📋 Copia Righe Selezionate", self)
         act_copy.setShortcut(QKeySequence.Copy)
         act_copy.triggered.connect(self._copy_selection)
@@ -1088,6 +1505,18 @@ class LanScannerWindow(QMainWindow):
         act_ping_cont = QAction("📈 Ping Continuo & Latenza...", self)
         act_ping_cont.triggered.connect(self._open_continuous_ping_selected)
         menu_tools.addAction(act_ping_cont)
+
+        act_custom_port = QAction("🎯 Scansione Porte Personalizzata...", self)
+        act_custom_port.triggered.connect(self._open_custom_port_scan_selected)
+        menu_tools.addAction(act_custom_port)
+
+        act_trace = QAction("🛤️ Visualizza Traceroute (Rotta IP)...", self)
+        act_trace.triggered.connect(self._open_traceroute_selected)
+        menu_tools.addAction(act_trace)
+
+        act_note = QAction("✏️ Assegna / Modifica Nota Dispositivo...", self)
+        act_note.triggered.connect(self._edit_note_selected)
+        menu_tools.addAction(act_note)
 
         act_detail = QAction("🔍 Dettaglio Dispositivo...", self)
         act_detail.triggered.connect(self._open_detail_selected)
@@ -1192,7 +1621,6 @@ class LanScannerWindow(QMainWindow):
         self.btn_print.setCursor(Qt.PointingHandCursor)
         self.btn_print.clicked.connect(self._print_report)
 
-        # Quick Theme Dropdown
         self.btn_theme_quick = QToolButton()
         self.btn_theme_quick.setObjectName("ThemeToolBtn")
         self.btn_theme_quick.setPopupMode(QToolButton.InstantPopup)
@@ -1240,11 +1668,12 @@ class LanScannerWindow(QMainWindow):
         self.cmb_adapters.setFixedWidth(200)
         self.cmb_adapters.currentIndexChanged.connect(self._on_adapter_selected)
 
-        lbl_s = QLabel("IP Iniziale:")
+        lbl_s = QLabel("IP Iniziale / CIDR:")
         lbl_s.setFont(QFont("Segoe UI", 9.5, QFont.Bold))
         self.txt_ip_start = QLineEdit()
-        self.txt_ip_start.setFixedWidth(120)
+        self.txt_ip_start.setFixedWidth(135)
         self.txt_ip_start.setFont(QFont("Consolas", 10))
+        self.txt_ip_start.textChanged.connect(self._on_ip_start_changed)
 
         lbl_e = QLabel("IP Finale:")
         lbl_e.setFont(QFont("Segoe UI", 9.5, QFont.Bold))
@@ -1261,6 +1690,11 @@ class LanScannerWindow(QMainWindow):
         btn_auto_sub.setCursor(Qt.PointingHandCursor)
         btn_auto_sub.clicked.connect(self._set_local_subnet)
 
+        btn_cidr_info = QPushButton("📐 Subnet Info")
+        btn_cidr_info.setObjectName("ControlBtn")
+        btn_cidr_info.setCursor(Qt.PointingHandCursor)
+        btn_cidr_info.clicked.connect(self._open_subnet_calc)
+
         row_inputs.addWidget(lbl_adapter)
         row_inputs.addWidget(self.cmb_adapters)
         row_inputs.addWidget(lbl_s)
@@ -1268,6 +1702,7 @@ class LanScannerWindow(QMainWindow):
         row_inputs.addWidget(lbl_e)
         row_inputs.addWidget(self.txt_ip_end)
         row_inputs.addWidget(btn_auto_sub)
+        row_inputs.addWidget(btn_cidr_info)
 
         row_inputs.addSpacing(10)
 
@@ -1275,7 +1710,7 @@ class LanScannerWindow(QMainWindow):
         lbl_filter = QLabel("🔎 Filtra:")
         lbl_filter.setFont(QFont("Segoe UI", 9.5))
         self.txt_filter = QLineEdit()
-        self.txt_filter.setPlaceholderText("Cerca IP, MAC, Hostname...")
+        self.txt_filter.setPlaceholderText("Cerca IP, MAC, Hostname, Note...")
         self.txt_filter.setFont(QFont("Segoe UI", 9.5))
         self.txt_filter.textChanged.connect(self._apply_filter)
 
@@ -1319,7 +1754,7 @@ class LanScannerWindow(QMainWindow):
         footer_layout = QHBoxLayout(footer_bar)
         footer_layout.setContentsMargins(10, 1, 10, 1)
 
-        self.lbl_status_msg = QLabel("Pronto — Inserisci un intervallo IP ed avvia la scansione")
+        self.lbl_status_msg = QLabel("Pronto — Inserisci un intervallo IP o notazione CIDR ed avvia la scansione")
         self.lbl_status_msg.setObjectName("FooterStatus")
 
         lbl_credits = QLabel(
@@ -1350,6 +1785,17 @@ class LanScannerWindow(QMainWindow):
             self.txt_ip_end.setText(s_b)
             self.lbl_status_msg.setText(f"Selezionata scheda: {ip} → Intervallo: {s_a} - {s_b}")
 
+    def _on_ip_start_changed(self, text: str) -> None:
+        txt = text.strip()
+        if "/" in txt:
+            try:
+                net = ipaddress.IPv4Network(txt, strict=False)
+                hosts = list(net.hosts())
+                if hosts:
+                    self.txt_ip_end.setText(str(hosts[-1]))
+            except ValueError:
+                pass
+
     # --- SCAN LOGIC & WORKER ---
 
     def _set_local_subnet(self) -> None:
@@ -1357,6 +1803,10 @@ class LanScannerWindow(QMainWindow):
         self.txt_ip_start.setText(a)
         self.txt_ip_end.setText(b)
         self.lbl_status_msg.setText(f"Rilevata subnet locale: {a} - {b}")
+
+    def _open_subnet_calc(self) -> None:
+        cidr_str = self.txt_ip_start.text().strip()
+        SubnetCalculatorDialog(cidr_str, self).exec()
 
     def _on_scan_button_clicked(self) -> None:
         if self.scan_worker and self.scan_worker.isRunning():
@@ -1372,20 +1822,17 @@ class LanScannerWindow(QMainWindow):
         s1 = self.txt_ip_end.text().strip()
 
         try:
-            ipaddress.IPv4Address(s0)
-            ipaddress.IPv4Address(s1)
-        except ValueError:
-            QMessageBox.critical(self, "Errore", "Indirizzi IPv4 non validi.")
+            hosts = _parse_ip_input(s0, s1)
+        except Exception as e:
+            QMessageBox.critical(self, "Errore Intervallo IP", f"Impossibile interpretare l'intervallo IP/CIDR: {e}")
             return
 
-        try:
-            hosts = _iter_ipv4(s0, s1)
-        except Exception as e:
-            QMessageBox.critical(self, "Errore", f"Impossibile generare l'intervallo IP: {e}")
+        if not hosts:
+            QMessageBox.critical(self, "Errore", "Nessun indirizzo IP valido nell'intervallo specificato.")
             return
 
         if len(hosts) > 4096:
-            QMessageBox.critical(self, "Errore", "L'intervallo massimo consentito è di 4096 indirizzi IP.")
+            QMessageBox.critical(self, "Errore", "L'intervallo massimo consentito per singola scansione è di 4096 indirizzi IP.")
             return
 
         self.add_recent_range(s0, s1)
@@ -1395,9 +1842,9 @@ class LanScannerWindow(QMainWindow):
 
         self.btn_scan.setText("🛑 Interrompi")
         self.btn_scan.setEnabled(True)
-        self.lbl_status_msg.setText(f"Scansione in corso su {len(hosts)} host IPv4 (Ping ICMP + ARP Cache)...")
+        self.lbl_status_msg.setText(f"Scansione ICMP Nativa + ARP Cache su {len(hosts)} host IPv4 in corso...")
 
-        self.scan_worker = ScanWorkerThread(hosts, max_workers=48)
+        self.scan_worker = ScanWorkerThread(hosts, self.device_notes, max_workers=64)
         self.scan_worker.progress_updated.connect(self._on_scan_progress)
         self.scan_worker.initial_alive_found.connect(self._on_initial_alive)
         self.scan_worker.hostname_resolved.connect(self._on_hostname_resolved)
@@ -1409,22 +1856,23 @@ class LanScannerWindow(QMainWindow):
     @Slot(int, int)
     def _on_scan_progress(self, done: int, total: int) -> None:
         self.prog_bar.setValue(done)
-        self.lbl_status_msg.setText(f"Ping ICMP in corso: {done}/{total} host verificati...")
+        self.lbl_status_msg.setText(f"Scansione Ping Nativa in corso: {done}/{total} host verificati...")
 
     @Slot(list)
-    def _on_initial_alive(self, rows: List[Tuple[str, str, str, str, str, str]]) -> None:
+    def _on_initial_alive(self, rows: List[Tuple[str, str, str, str, str, str, str]]) -> None:
         for r in rows:
             item = QTreeWidgetItem(self.table, list(r))
             item.setTextAlignment(1, Qt.AlignCenter)
 
-    @Slot(str, str, str)
-    def _on_hostname_resolved(self, ip: str, hostname: str, hint: str) -> None:
+    @Slot(str, str, str, str)
+    def _on_hostname_resolved(self, ip: str, hostname: str, hint: str, note: str) -> None:
         root = self.table.invisibleRootItem()
         for i in range(root.childCount()):
             item = root.child(i)
             if item.text(0) == ip:
                 item.setText(4, hostname)
                 item.setText(5, hint)
+                item.setText(6, note)
                 break
 
     @Slot(int)
@@ -1432,7 +1880,7 @@ class LanScannerWindow(QMainWindow):
         self.prog_bar.setValue(self.prog_bar.maximum())
         self.btn_scan.setText("🔍 Scansiona")
         self.btn_scan.setEnabled(True)
-        self.lbl_status_msg.setText(f"Scansione completata: trovati {total_alive} host attivi nella LAN.")
+        self.lbl_status_msg.setText(f"Scansione completata con successo: trovati {total_alive} host attivi nella LAN.")
 
     @Slot()
     def _on_scan_interrupted(self) -> None:
@@ -1476,37 +1924,52 @@ class LanScannerWindow(QMainWindow):
 
             menu.addSeparator()
 
-            act_web = menu.addAction(f"🌐 Apri Interfaccia Web (http://{ip})")
+            act_web = menu.addAction(f"🌐 Apri Web Browser (http://{ip})")
             act_web.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(f"http://{ip}")))
 
-            act_webs = menu.addAction(f"🔒 Apri Interfaccia Web Sicura (https://{ip})")
+            act_webs = menu.addAction(f"🔒 Apri Web Sicuro (https://{ip})")
             act_webs.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(f"https://{ip}")))
 
-            act_rdp = menu.addAction(f"🖥️ Connetti via Desktop Remoto (RDP)")
+            act_rdp = menu.addAction("🖥️ Connetti via Desktop Remoto (RDP)")
             act_rdp.triggered.connect(lambda: self._launch_rdp(ip))
+
+            act_ssh = menu.addAction("💻 Terminale SSH (ssh user@ip)")
+            act_ssh.triggered.connect(lambda: self._launch_ssh(ip))
 
             act_smb = menu.addAction(f"📁 Apri Condivisione File (SMB - \\\\{ip})")
             act_smb.triggered.connect(lambda: self._launch_smb(ip))
 
             if mac and mac != "—":
-                act_wol = menu.addAction(f"⚡ Invia Pacchetto Wake-on-LAN (WoL)")
+                act_wol = menu.addAction("⚡ Invia Pacchetto Wake-on-LAN (WoL)")
                 act_wol.triggered.connect(lambda: self._trigger_wol(mac, ip))
 
             menu.addSeparator()
 
-            act_ping_cont = menu.addAction(f"📈 Ping Continuo & Monitor Latenza...")
+            act_ping_cont = menu.addAction("📈 Monitor Latenza & Ping Continuo...")
             act_ping_cont.triggered.connect(lambda: ContinuousPingDialog(ip, self).exec())
 
-            act_det = menu.addAction("🔍 Dettaglio Dispositivo & Porte...")
+            act_custom_p = menu.addAction("🎯 Scansione Porte Personalizzata...")
+            act_custom_p.triggered.connect(lambda: CustomPortScanDialog(ip, self).exec())
+
+            act_trace = menu.addAction("🛤️ Visualizza Traceroute (Rotta IP)...")
+            act_trace.triggered.connect(lambda: TracerouteDialog(ip, self).exec())
+
+            act_note = menu.addAction("✏️ Assegna / Modifica Nota Dispositivo...")
+            act_note.triggered.connect(lambda: self._edit_note_item(item))
+
+            act_det = menu.addAction("🔍 Dettaglio Completo Dispositivo...")
             act_det.triggered.connect(lambda: self._open_detail_item(item))
 
         menu.addSeparator()
 
-        act_exp_all = menu.addAction("💾 Esporta Tutti i Risultati in CSV")
-        act_exp_all.triggered.connect(lambda: self._export_csv_action(only_selected=False))
+        act_exp_all_csv = menu.addAction("💾 Esporta Tutti i Risultati in CSV")
+        act_exp_all_csv.triggered.connect(lambda: self._export_csv_action(only_selected=False))
 
-        act_exp_sel = menu.addAction("💾 Esporta Solo Selezione in CSV")
-        act_exp_sel.triggered.connect(lambda: self._export_csv_action(only_selected=True))
+        act_exp_json = menu.addAction("📄 Esporta Tutti i Risultati in JSON")
+        act_exp_json.triggered.connect(lambda: self._export_json_action(only_selected=False))
+
+        act_exp_html = menu.addAction("🌐 Esporta Report HTML Interattivo")
+        act_exp_html.triggered.connect(lambda: self._export_html_action(only_selected=False))
 
         menu.addSeparator()
         act_info = menu.addAction("ℹ️ Informazioni e Crediti")
@@ -1520,6 +1983,13 @@ class LanScannerWindow(QMainWindow):
             self.lbl_status_msg.setText(f"Avviata connessione Desktop Remoto a {ip}...")
         except Exception as e:
             QMessageBox.critical(self, "RDP", f"Impossibile avviare RDP: {e}")
+
+    def _launch_ssh(self, ip: str) -> None:
+        try:
+            subprocess.Popen(["cmd.exe", "/c", "start", "cmd.exe", "/k", f"ssh {ip}"])
+            self.lbl_status_msg.setText(f"Avviata sessione SSH per {ip}...")
+        except Exception as e:
+            QMessageBox.critical(self, "SSH", f"Impossibile aprire il terminale SSH: {e}")
 
     def _launch_smb(self, ip: str) -> None:
         try:
@@ -1553,6 +2023,54 @@ class LanScannerWindow(QMainWindow):
         ip = selected[0].text(0)
         ContinuousPingDialog(ip, self).exec()
 
+    def _open_custom_port_scan_selected(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "Port Scan", "Seleziona una riga dalla tabella.")
+            return
+        ip = selected[0].text(0)
+        CustomPortScanDialog(ip, self).exec()
+
+    def _open_traceroute_selected(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "Traceroute", "Seleziona una riga dalla tabella.")
+            return
+        ip = selected[0].text(0)
+        TracerouteDialog(ip, self).exec()
+
+    def _edit_note_selected(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "Nota Utente", "Seleziona una riga dalla tabella.")
+            return
+        self._edit_note_item(selected[0])
+
+    def _edit_note_item(self, item: QTreeWidgetItem) -> None:
+        ip = item.text(0)
+        mac = item.text(2)
+        old_note = item.text(6) if item.columnCount() > 6 else ""
+        if old_note == "—":
+            old_note = ""
+
+        new_note, ok = QInputDialog.getText(
+            self,
+            "Nota Personalizzata Dispositivo",
+            f"Inserisci o modifica la nota per l'host {ip} (MAC: {mac}):",
+            QLineEdit.Normal,
+            old_note,
+        )
+        if ok:
+            note_txt = new_note.strip()
+            key = mac if (mac and mac != "—") else ip
+            if note_txt:
+                self.device_notes[key] = note_txt
+            else:
+                self.device_notes.pop(key, None)
+            self._save_device_notes()
+            item.setText(6, note_txt or "—")
+            self.lbl_status_msg.setText(f"Nota aggiornata per {ip}.")
+
     def _open_detail_item(self, item: QTreeWidgetItem) -> None:
         values = tuple(item.text(i) for i in range(item.columnCount()))
         if values:
@@ -1573,15 +2091,23 @@ class LanScannerWindow(QMainWindow):
         cb.setText("\n".join(lines))
         self.lbl_status_msg.setText(f"Copiate {len(selected)} righe negli appunti.")
 
-    # --- CSV EXPORT & PRINTING ---
+    # --- EXPORTS & PRINTING ---
 
     def _export_csv_dialog(self) -> None:
         self._export_csv_action(only_selected=False)
 
-    def _export_csv_action(self, only_selected: bool = False) -> None:
-        root = self.table.invisibleRootItem()
-        items = self.table.selectedItems() if only_selected else [root.child(i) for i in range(root.childCount())]
+    def _export_json_dialog(self) -> None:
+        self._export_json_action(only_selected=False)
 
+    def _export_html_dialog(self) -> None:
+        self._export_html_action(only_selected=False)
+
+    def _get_export_items(self, only_selected: bool) -> List[QTreeWidgetItem]:
+        root = self.table.invisibleRootItem()
+        return self.table.selectedItems() if only_selected else [root.child(i) for i in range(root.childCount())]
+
+    def _export_csv_action(self, only_selected: bool = False) -> None:
+        items = self._get_export_items(only_selected)
         if not items:
             QMessageBox.warning(self, "Esporta CSV", "Nessun dato presente da esportare.")
             return
@@ -1608,6 +2134,126 @@ class LanScannerWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Errore Esportazione", f"Impossibile salvare il file: {e}")
 
+    def _export_json_action(self, only_selected: bool = False) -> None:
+        items = self._get_export_items(only_selected)
+        if not items:
+            QMessageBox.warning(self, "Esporta JSON", "Nessun dato presente da esportare.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Esporta Risultati in JSON",
+            "LanScanner_Results.json",
+            "File JSON (*.json);;Tutti i file (*.*)",
+        )
+        if not filename:
+            return
+
+        try:
+            records = []
+            for item in items:
+                records.append({
+                    "ip": item.text(0),
+                    "status": item.text(1),
+                    "mac": item.text(2),
+                    "vendor": item.text(3),
+                    "hostname": item.text(4),
+                    "hint": item.text(5),
+                    "note": item.text(6) if item.columnCount() > 6 else "",
+                })
+
+            export_data = {
+                "app": APP_NAME,
+                "version": APP_VERSION,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "total_hosts": len(records),
+                "hosts": records,
+            }
+
+            with open(filename, "w", encoding="utf-8") as fp:
+                json.dump(export_data, fp, indent=2, ensure_ascii=False)
+
+            self.lbl_status_msg.setText(f"Esportazione JSON completata: {filename}")
+            QMessageBox.information(self, "Esportazione JSON", f"File esportato con successo:\n{filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Errore Esportazione", f"Impossibile salvare il file: {e}")
+
+    def _export_html_action(self, only_selected: bool = False) -> None:
+        items = self._get_export_items(only_selected)
+        if not items:
+            QMessageBox.warning(self, "Esporta HTML", "Nessun dato presente da esportare.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Esporta Report HTML Interattivo",
+            "LanScanner_Report.html",
+            "File HTML (*.html);;Tutti i file (*.*)",
+        )
+        if not filename:
+            return
+
+        try:
+            rows_html = []
+            for idx, item in enumerate(items):
+                bg = "#ffffff" if idx % 2 == 0 else "#f8fafc"
+                cols = "".join(f"<td>{item.text(c)}</td>" for c in range(item.columnCount()))
+                rows_html.append(f"<tr style='background-color:{bg};'>{cols}</tr>")
+
+            headers_html = "".join(f"<th>{h}</th>" for h in COL_HEADERS)
+
+            html_content = f"""<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>LanScanner v{APP_VERSION} — Report Scansione LAN</title>
+    <style>
+        body {{ font-family: 'Segoe UI', system-ui, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }}
+        .card {{ background-color: #1e293b; border-radius: 14px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #334155; }}
+        h1 {{ margin-top: 0; color: #38bdf8; font-size: 24px; display: flex; align-items: center; gap: 10px; }}
+        .meta {{ color: #94a3b8; font-size: 13px; margin-bottom: 20px; }}
+        input {{ width: 100%; max-width: 400px; padding: 10px 14px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #fff; margin-bottom: 16px; font-size: 14px; }}
+        table {{ width: 100%; border-collapse: collapse; border-radius: 10px; overflow: hidden; }}
+        th {{ background-color: #334155; color: #38bdf8; text-align: left; padding: 12px; font-size: 13px; }}
+        td {{ padding: 10px 12px; color: #0f172a; font-size: 13px; border-bottom: 1px solid #e2e8f0; }}
+        tr:hover {{ background-color: #e0f2fe !important; }}
+        footer {{ margin-top: 24px; font-size: 11px; color: #64748b; text-align: center; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>📡 LanScanner v{APP_VERSION} — Report Scansione LAN</h1>
+        <div class="meta">
+            <b>Data Generazione:</b> {time.strftime('%d/%m/%Y %H:%M:%S')} | 
+            <b>Host Rilevati:</b> {len(items)} | 
+            <b>Autore:</b> {APP_DEVELOPER} ({APP_COMPANY})
+        </div>
+        <input type="text" id="search" onkeyup="filterTable()" placeholder="🔎 Cerca IP, Hostname, Vendor, MAC, Note...">
+        <table id="results">
+            <thead><tr>{headers_html}</tr></thead>
+            <tbody>{"".join(rows_html)}</tbody>
+        </table>
+    </div>
+    <footer>Generato da LanScanner Portable • <a href="{WEBSITE_URL}" style="color:#38bdf8;">vcuria.app</a></footer>
+    <script>
+        function filterTable() {{
+            var input = document.getElementById("search").value.toLowerCase();
+            var rows = document.querySelectorAll("#results tbody tr");
+            rows.forEach(function(row) {{
+                row.style.display = row.innerText.toLowerCase().includes(input) ? "" : "none";
+            }});
+        }}
+    </script>
+</body>
+</html>"""
+            with open(filename, "w", encoding="utf-8") as fp:
+                fp.write(html_content)
+
+            self.lbl_status_msg.setText(f"Esportazione HTML completata: {filename}")
+            QMessageBox.information(self, "Esportazione HTML", f"Report HTML generato con successo:\n{filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Errore Esportazione", f"Impossibile salvare il report HTML: {e}")
+
     def _print_report(self) -> None:
         root = self.table.invisibleRootItem()
         count = root.childCount()
@@ -1622,7 +2268,7 @@ class LanScannerWindow(QMainWindow):
                 f"<h2>{APP_NAME} — Report Scansione LAN</h2>",
                 f"<p><b>Data:</b> {time.strftime('%d/%m/%Y %H:%M')} | <b>Host Trovati:</b> {count}</p>",
                 "<table border='1' cellspacing='0' cellpadding='5' style='border-collapse:collapse; width:100%; font-family: Segoe UI, sans-serif;'>",
-                "tr bgcolor='#f1f5f9'>" + "".join(f"<th>{h}</th>" for h in COL_HEADERS) + "</tr>"
+                "tr bgcolor='#f1f5f9'>" + "".join(f"<th>{h}</th>" for h in COL_HEADERS) + "</tr>",
             ]
 
             for i in range(count):
@@ -1745,7 +2391,7 @@ class LanScannerWindow(QMainWindow):
                 "footer_status": "#38bdf8",
                 "footer_credits": "#94a3b8",
             }
-        else:  # light
+        else:
             c = {
                 "window_bg": "#f8fafc",
                 "menubar_bg": "#ffffff",
@@ -2022,7 +2668,7 @@ class LanScannerWindow(QMainWindow):
 
 def main() -> None:
     if sys.platform != "win32":
-        print("LanScanner è progettato esclusivamente per sistemi Windows.")
+        print("LanScanner è progettato principalmente per sistemi Windows.")
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
