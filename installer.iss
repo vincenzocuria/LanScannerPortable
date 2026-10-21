@@ -1,7 +1,7 @@
 [Setup]
 AppId={{C1542B73-8902-4A8D-9E11-3E5A4B1A77E2}}
 AppName=LanScanner
-AppVersion=1.3.1
+AppVersion=1.3.2
 AppPublisher=NGV Group S.R.L.
 AppPublisherURL=https://vcuria.app
 AppSupportURL=https://vcuria.app
@@ -12,7 +12,7 @@ DisableProgramGroupPage=yes
 DisableDirPage=yes
 UsePreviousAppDir=no
 OutputDir=dist
-OutputBaseFilename=LanScanner_Setup_v1.3.1
+OutputBaseFilename=LanScanner_Setup_v1.3.2
 SetupIconFile=app_icon.ico
 Compression=lzma2/ultra64
 SolidCompression=yes

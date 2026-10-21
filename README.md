@@ -1,10 +1,24 @@
-# LanScanner v1.3.1 — Network Scanner Portatile per Windows
+# LanScanner v1.3.2 — Network Scanner Portatile per Windows
 
 **LanScanner** è uno strumento leggero, veloce e moderno per la scansione ed esplorazione degli host attivi sulla rete locale (LAN IPv4).
 
 Realizzato in Python con interfaccia grafica **PySide6 (Qt 6)** e design **Material 3 Expressive**.
 
 ---
+
+## ⬇️ Novità v1.3.2
+
+- **Aggiornamento automatico**: quando esce una nuova versione, "Aggiorna e riavvia" scarica `LanScanner.exe` dalla release GitHub, ne verifica dimensione e SHA-256, sostituisce l'exe in uso e riavvia l'app. Il file della versione precedente viene cancellato al primo avvio successivo.
+- **Dispositivi nuovi**: dopo la prima scansione l'app ricorda i MAC visti; quelli mai visti prima compaiono in grassetto con "🆕 Nuovo" (Strumenti → Azzera elenco dispositivi conosciuti per ripartire).
+- **Ordinamento**: clic sulle intestazioni della tabella; IP e latenza ordinati in modo numerico.
+- **Esporta Report PDF** diretto (orizzontale A4), anche dal menu contestuale; la stampa è ora orizzontale.
+- **Traceroute**: mostra anche gli hop che non rispondono e risolve i nomi senza rallentare il percorso.
+- **Calcolatore subnet**: wildcard, tipo di indirizzo (privato, loopback, APIPA, multicast), /31 e /32 corretti; nessun blocco con reti grandi (prima `/8` bloccava la finestra per ~10 s, anche solo digitandola nel campo IP).
+- **Wake-on-LAN** inviato da ogni scheda di rete, sia in broadcast sia sulla subnet, porte 9 e 7.
+- **SSH** con richiesta del nome utente (ricordato) e avviso se il client OpenSSH non è installato.
+- **Ping continuo** con latenza minima e massima; le risposte sotto il millisecondo compaiono come "<1 ms".
+- Ctrl+R durante una scansione non ne avvia una seconda (prima la tabella si riempiva di righe doppie); "Interrompi" non lascia più hostname a "...".
+- "MAC su più IP" segnalato solo se gli IP con lo stesso MAC rispondono entrambi al ping. Un IP rimasto solo nella cache ARP con il MAC di un host attivo è indicato come "IP precedente di …" (tipico cambio di indirizzo DHCP), non più come conflitto.
 
 ## 🔧 Novità v1.3.1 (correzioni)
 
@@ -61,9 +75,9 @@ python build_exe.py
 ```
 
 ### 4. Generazione dell'Installer Windows (Inno Setup)
-Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.3.1.exe`.
+Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.3.2.exe`.
 
-L'eseguibile e l'installer si pubblicano come asset delle [Release GitHub](https://github.com/vincenzocuria/LanScannerPortable/releases), non nel repository.
+L'eseguibile e l'installer si pubblicano come asset delle [Release GitHub](https://github.com/vincenzocuria/LanScannerPortable/releases), non nel repository. L'aggiornamento automatico e il pulsante di download su vcuria.app cercano un asset chiamato esattamente `LanScanner.exe`: va allegato a ogni release.
 
 ### 5. Aggiornamento del database produttori
 ```bash
