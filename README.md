@@ -1,4 +1,4 @@
-# LanScanner v1.3.0 — Network Scanner Portatile per Windows
+# LanScanner v1.3.1 — Network Scanner Portatile per Windows
 
 **LanScanner** è uno strumento leggero, veloce e moderno per la scansione ed esplorazione degli host attivi sulla rete locale (LAN IPv4).
 
@@ -6,14 +6,26 @@ Realizzato in Python con interfaccia grafica **PySide6 (Qt 6)** e design **Mater
 
 ---
 
-## 🎨 Caratteristiche Principali (v1.3.0)
+## 🔧 Novità v1.3.1 (correzioni)
+
+- Scansione porte personalizzata e "Analizza Dettagliatamente" ora mostrano i risultati (prima restavano su "in corso...").
+- Nome mDNS (`.local`) letto correttamente dalla risposta DNS (prima poteva comparire un ottetto dell'IP, es. `10.local`).
+- Risoluzione dei nomi in parallelo: su una LAN con molti dispositivi senza nome DNS passa da minuti a pochi secondi.
+- "Interrompi" ferma subito la scansione; il ping continuo si ferma davvero alla chiusura della finestra.
+- Intervallo proposto in base alla subnet mask reale della scheda (non più sempre /24); rilevamento schede indipendente dalla lingua di Windows.
+- Database produttori con i blocchi MA-M e MA-S (prefissi /28 e /36): produttore corretto per molti dispositivi IoT.
+- Avviso "MAC su più IP" per possibili conflitti; stato "Solo ARP (no ping)" per i dispositivi presenti solo nella cache ARP.
+- Report HTML e stampa: intestazione della tabella corretta e dati di rete escapati.
+- Eseguibile compilato senza UPX per ridurre i falsi positivi degli antivirus.
+
+## 🎨 Caratteristiche Principali
 
 - **Interfaccia Grafica Material 3 Expressive**:
   - TopBar moderna con logo icona, chip versione, pulsanti ad azione rapida e badge sviluppatore.
   - **Commutazione Temi Dinamica**: Tema **Chiaro (☀️)**, **Scuro (🌙)** e **Automatico (💻)** sincronizzato con le impostazioni di sistema di Windows.
 - **Scansione ICMP Nativa ad Altissima Velocità**:
   - Utilizzo diretto delle API native di Windows (`IcmpSendEcho` via `ctypes`) per una velocità fino a 10 volte superiore.
-  - Rilevamento automatico della subnet locale ed avviso di eventuali conflitti IP / MAC duplicati.
+  - Rilevamento automatico della subnet locale ed avviso di eventuali MAC duplicati su più IP.
   - **Supporto Notazione CIDR e Calcolatore Subnet**: Inserimento diretto di notazioni come `192.168.1.0/24` e strumento di calcolo subnet integrato.
 - **Service Discovery & Protocolli Avanzati**:
   - **Risoluzione mDNS / Bonjour (`.local`)** e **SSDP / UPnP Multicast Probe** per identificare automaticamente Smart TV, NAS Synology/QNAP, dispositivi IoT e stampanti.
@@ -36,14 +48,27 @@ Realizzato in Python con interfaccia grafica **PySide6 (Qt 6)** e design **Mater
 pip install -r requirements.txt
 ```
 
-### 2. Generazione dell'Eseguibile Portatile (.exe)
+### 2. Test
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q tests
+```
+
+### 3. Generazione dell'Eseguibile Portatile (.exe)
 Per generare l'eseguibile standalone portatile `dist/LanScanner.exe`:
 ```bash
 python build_exe.py
 ```
 
-### 3. Generazione dell'Installer Windows (Inno Setup)
-Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.3.0.exe`.
+### 4. Generazione dell'Installer Windows (Inno Setup)
+Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.3.1.exe`.
+
+L'eseguibile e l'installer si pubblicano come asset delle [Release GitHub](https://github.com/vincenzocuria/LanScannerPortable/releases), non nel repository.
+
+### 5. Aggiornamento del database produttori
+```bash
+python regen_oui_vendor.py
+```
 
 ---
 

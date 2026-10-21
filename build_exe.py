@@ -11,6 +11,8 @@ def build():
         "--clean",
         "--onefile",
         "--windowed",
+        # UPX fa scattare più spesso i falsi positivi degli antivirus sugli eseguibili PyInstaller
+        "--noupx",
         "--name=LanScanner",
         "--icon=app_icon.ico",
         "--add-data=oui_vendor.zlib;.",
