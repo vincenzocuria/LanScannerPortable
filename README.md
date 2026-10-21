@@ -75,9 +75,9 @@ python build_exe.py
 ```
 
 ### 4. Generazione dell'Installer Windows (Inno Setup)
-Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.3.2.exe`.
+Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup.exe`.
 
-L'eseguibile e l'installer si pubblicano come asset delle [Release GitHub](https://github.com/vincenzocuria/LanScannerPortable/releases), non nel repository. L'aggiornamento automatico e il pulsante di download su vcuria.app cercano un asset chiamato esattamente `LanScanner.exe`: va allegato a ogni release.
+L'eseguibile e l'installer si pubblicano come asset delle [Release GitHub](https://github.com/vincenzocuria/LanScannerPortable/releases), non nel repository. Ogni release deve allegare **`LanScanner.exe`** e **`LanScanner_Setup.exe`** con questi nomi esatti: li usano l'aggiornamento automatico dell'app e i pulsanti "Scarica Portable" e "Scarica Installer" di [vcuria.app](https://vcuria.app/apps/lan-scanner) (link `releases/latest/download/<nome>`).
 
 ### 5. Aggiornamento del database produttori
 ```bash
