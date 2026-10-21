@@ -11,9 +11,11 @@ import concurrent.futures
 import csv
 import ctypes
 import ctypes.wintypes
+import hashlib
 import html
 import ipaddress
 import json
+import os
 import pathlib
 import re
 import socket
@@ -72,7 +74,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "LanScanner"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 APP_COMPANY = "NGV Group S.R.L."
 APP_DEVELOPER = "Vincenzo Curia"
 GITHUB_REPO = "vincenzocuria/LanScannerPortable"
@@ -146,7 +148,13 @@ def _vendor_from_mac(mac: str) -> str:
 
 
 def _quick_hint(
-    hostname: str, vendor: str, mac: str, mdns: str = "", ssdp: str = "", mac_ip_count: int = 0
+    hostname: str,
+    vendor: str,
+    mac: str,
+    mdns: str = "",
+    ssdp: str = "",
+    mac_ip_count: int = 0,
+    previous_ip_of: str = "",
 ) -> str:
     h = (hostname or "").lower()
     v = (vendor or "").lower()
@@ -157,9 +165,11 @@ def _quick_hint(
 
     hints: List[str] = []
 
+    if previous_ip_of:
+        hints.append(f"IP precedente di {previous_ip_of}?")
     if mac_ip_count > 1:
-        # Può essere un conflitto IP, un proxy ARP o un dispositivo con più indirizzi
-        hints.append(f"⚠️ MAC su {mac_ip_count} IP")
+        # Due IP attivi con lo stesso MAC: conflitto, proxy ARP o un dispositivo con più indirizzi
+        hints.append(f"⚠️ MAC su {mac_ip_count} IP attivi")
 
     if ssdp:
         hints.append(f"UPnP: {ssdp[:24]}")
@@ -643,10 +653,140 @@ def _probe_ports_with_banner(
     return sorted(results)
 
 
+# --- AGGIORNAMENTO AUTOMATICO ---
+
+UPDATE_ASSET_NAME = "LanScanner.exe"
+
+
+def _pick_update_asset(release: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Dati del file LanScanner.exe di una release GitHub: url, dimensione e SHA-256 dichiarato."""
+    for asset in release.get("assets") or []:
+        if asset.get("name") == UPDATE_ASSET_NAME and asset.get("browser_download_url"):
+            digest = str(asset.get("digest") or "")
+            return {
+                "url": asset["browser_download_url"],
+                "size": int(asset.get("size") or 0),
+                "sha256": digest.split(":", 1)[1].lower() if digest.startswith("sha256:") else "",
+            }
+    return None
+
+
+def _can_self_update() -> bool:
+    """Solo l'exe compilato può sostituirsi; da sorgente si apre la pagina della release."""
+    return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
+
+
+def _current_exe() -> pathlib.Path:
+    return pathlib.Path(sys.executable).resolve()
+
+
+def _download_update(
+    asset: Dict[str, Any],
+    dest: pathlib.Path,
+    progress=None,
+    cancel: Optional[threading.Event] = None,
+) -> pathlib.Path:
+    """Scarica il nuovo exe accanto a quello attuale e lo verifica (dimensione, SHA-256, intestazione MZ)."""
+    part = dest.with_name(dest.name + ".part")
+    expected_size = int(asset.get("size") or 0)
+    h = hashlib.sha256()
+    done = 0
+    req = urllib.request.Request(asset["url"], headers={"User-Agent": "LanScanner-Updater"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp, open(part, "wb") as fp:
+            total = expected_size or int(resp.headers.get("Content-Length") or 0)
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("download annullato")
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                fp.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total)
+        if expected_size and done != expected_size:
+            raise RuntimeError(f"file incompleto ({done} di {expected_size} byte)")
+        if asset.get("sha256") and h.hexdigest().lower() != asset["sha256"]:
+            raise RuntimeError("checksum SHA-256 non corrispondente: file scartato")
+        with open(part, "rb") as fp:
+            if fp.read(2) != b"MZ":
+                raise RuntimeError("il file scaricato non è un eseguibile Windows")
+        os.replace(part, dest)
+        return dest
+    except BaseException:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _install_update(new_exe: pathlib.Path, current_exe: pathlib.Path) -> pathlib.Path:
+    """Mette il nuovo exe al posto di quello in uso.
+
+    Windows non permette di sovrascrivere un exe in esecuzione ma permette di rinominarlo:
+    l'attuale diventa .old (cancellato al prossimo avvio) e il nuovo prende il suo nome.
+    """
+    old = current_exe.with_name(current_exe.name + ".old")
+    if old.exists():
+        old.unlink()
+    os.replace(current_exe, old)
+    try:
+        os.replace(new_exe, current_exe)
+    except OSError:
+        os.replace(old, current_exe)
+        raise
+    return old
+
+
+def _launch_detached(exe: pathlib.Path) -> None:
+    env = dict(os.environ)
+    # Senza questa variabile il nuovo exe PyInstaller riuserebbe la cartella temporanea di questo processo
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([str(exe)], cwd=str(exe.parent), env=env, creationflags=flags, close_fds=True)
+
+
+def _cleanup_previous_update() -> None:
+    """Cancella il .old e i download rimasti dall'aggiornamento precedente (se non più in uso)."""
+    if not _can_self_update():
+        return
+    exe = _current_exe()
+    for leftover in (exe.name + ".old", exe.name + ".download", exe.name + ".download.part"):
+        try:
+            exe.with_name(leftover).unlink()
+        except OSError:
+            pass
+
+
+class UpdateDownloadThread(QThread):
+    progress = Signal(int, int)
+    downloaded = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, asset: Dict[str, Any], dest: pathlib.Path, parent=None):
+        super().__init__(parent)
+        self.asset = asset
+        self.dest = dest
+        self.cancel = threading.Event()
+
+    def run(self) -> None:
+        try:
+            path = _download_update(self.asset, self.dest, self.progress.emit, self.cancel)
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        self.downloaded.emit(str(path))
+
+
 # --- BACKGROUND THREADS ---
 
 class UpdateCheckerThread(QThread):
-    update_found = Signal(str, str, str)
+    update_found = Signal(str, str, str, object)  # tag, pagina release, note, asset exe (o None)
     no_update_found = Signal(str)
     check_failed = Signal(str)
 
@@ -672,7 +812,7 @@ class UpdateCheckerThread(QThread):
                     notes = data.get("body", "")
 
                     if self._is_newer(latest_ver, self.current_version):
-                        self.update_found.emit(tag_name, html_url, notes)
+                        self.update_found.emit(tag_name, html_url, notes, _pick_update_asset(data))
                     else:
                         self.no_update_found.emit(self.current_version)
                     return
@@ -879,12 +1019,13 @@ class ScanWorkerThread(QThread):
             time.sleep(0.2)
             combined_arp = {**initial_arp, **_arp_map()}
 
-            # Stesso MAC su più IP dell'intervallo: possibile conflitto o proxy ARP
-            hosts_set = set(self.hosts)
-            mac_counts: Dict[str, int] = {}
+            # Stesso MAC su più IP che rispondono al ping: possibile conflitto, proxy ARP o più indirizzi.
+            # Un IP solo in cache ARP con il MAC di un host attivo è quasi sempre il suo indirizzo DHCP precedente.
+            alive_by_mac: Dict[str, List[str]] = {}
             for ip_s, m in combined_arp.items():
-                if ip_s in hosts_set:
-                    mac_counts[m] = mac_counts.get(m, 0) + 1
+                if ping_results.get(ip_s, (False, 0.0))[0]:
+                    alive_by_mac.setdefault(m, []).append(ip_s)
+            mac_counts = {m: len(ips) for m, ips in alive_by_mac.items()}
 
             rows: List[Tuple[str, str, str, str, str, str, str]] = []
             for ip in self.hosts:
@@ -912,7 +1053,13 @@ class ScanWorkerThread(QThread):
                 mac = combined_arp.get(ip, "")
                 v = _vendor_from_mac(mac) if mac else ""
                 disp_hn = hn or mdns_name or "—"
-                hint = _quick_hint(disp_hn, v, mac, mdns_name, ssdp_info, mac_counts.get(mac, 0))
+                alive_ok = ping_results.get(ip, (False, 0.0))[0]
+                current_ips = [] if alive_ok else alive_by_mac.get(mac, [])
+                hint = _quick_hint(
+                    disp_hn, v, mac, mdns_name, ssdp_info,
+                    mac_counts.get(mac, 0) if alive_ok else 0,
+                    previous_ip_of=current_ips[0] if current_ips else "",
+                )
                 note = self.device_notes.get(mac, self.device_notes.get(ip, "")) or "—"
                 self.hostname_resolved.emit(ip, disp_hn, hint, note)
                 self.names_progress.emit(done, len(sorted_ips))
@@ -1538,12 +1685,22 @@ class LegalDisclaimerDialog(QDialog):
 
 
 class UpdateDialog(QDialog):
-    def __init__(self, tag_version: str, download_url: str, release_notes: str, parent=None):
+    def __init__(
+        self,
+        tag_version: str,
+        download_url: str,
+        release_notes: str,
+        asset: Optional[Dict[str, Any]] = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Aggiornamento Disponibile")
-        self.setFixedSize(520, 380)
+        self.setFixedSize(520, 420)
         _set_window_icon(self)
         self.download_url = download_url
+        self.tag_version = tag_version
+        self.asset = asset if _can_self_update() else None
+        self._downloader: Optional[UpdateDownloadThread] = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
@@ -1565,25 +1722,96 @@ class UpdateDialog(QDialog):
         txt_notes.setFont(QFont("Segoe UI", 9))
         layout.addWidget(txt_notes)
 
+        self.prog = QProgressBar()
+        self.prog.setFixedHeight(12)
+        self.prog.setTextVisible(False)
+        self.prog.hide()
+        layout.addWidget(self.prog)
+
+        self.lbl_state = QLabel("")
+        self.lbl_state.setWordWrap(True)
+        self.lbl_state.setTextFormat(Qt.PlainText)
+        layout.addWidget(self.lbl_state)
+
         btn_box = QHBoxLayout()
-        btn_download = QPushButton("🌐 Scarica Aggiornamento su GitHub")
-        btn_download.setObjectName("PrimaryBtn")
-        btn_download.setCursor(Qt.PointingHandCursor)
-        btn_download.clicked.connect(self._open_download)
+        if self.asset:
+            self.btn_download = QPushButton("⬇️ Aggiorna e riavvia")
+            self.btn_download.clicked.connect(self._start_download)
+        else:
+            self.btn_download = QPushButton("🌐 Scarica Aggiornamento su GitHub")
+            self.btn_download.clicked.connect(self._open_download)
+        self.btn_download.setObjectName("PrimaryBtn")
+        self.btn_download.setCursor(Qt.PointingHandCursor)
 
-        btn_close = QPushButton("Chiudi")
-        btn_close.setObjectName("SecondaryBtn")
-        btn_close.setCursor(Qt.PointingHandCursor)
-        btn_close.clicked.connect(self.reject)
+        self.btn_page = QPushButton("Pagina release")
+        self.btn_page.setObjectName("SecondaryBtn")
+        self.btn_page.setCursor(Qt.PointingHandCursor)
+        self.btn_page.clicked.connect(self._open_download)
+        self.btn_page.setVisible(bool(self.asset))
 
-        btn_box.addWidget(btn_download)
+        self.btn_close = QPushButton("Più tardi" if self.asset else "Chiudi")
+        self.btn_close.setObjectName("SecondaryBtn")
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        self.btn_close.clicked.connect(self.reject)
+
+        btn_box.addWidget(self.btn_download)
+        btn_box.addWidget(self.btn_page)
         btn_box.addStretch()
-        btn_box.addWidget(btn_close)
+        btn_box.addWidget(self.btn_close)
         layout.addLayout(btn_box)
 
     def _open_download(self) -> None:
         QDesktopServices.openUrl(QUrl(self.download_url))
         self.accept()
+
+    def _start_download(self) -> None:
+        exe = _current_exe()
+        dest = exe.with_name(exe.name + ".download")
+        self.btn_download.setEnabled(False)
+        self.btn_page.setEnabled(False)
+        self.btn_close.setText("Annulla")
+        self.prog.show()
+        self.prog.setRange(0, 0)
+        self.lbl_state.setText(f"Download di {self.tag_version} in corso...")
+        self._downloader = UpdateDownloadThread(self.asset, dest)
+        _keep_alive(self._downloader)
+        self._downloader.progress.connect(self._on_progress)
+        self._downloader.downloaded.connect(self._on_downloaded)
+        self._downloader.failed.connect(self._on_failed)
+        self._downloader.start()
+
+    @Slot(int, int)
+    def _on_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            self.prog.setRange(0, 1000)
+            self.prog.setValue(int(done * 1000 / total))
+            self.lbl_state.setText(f"Download: {done / 1048576:.1f} di {total / 1048576:.1f} MB")
+
+    @Slot(str)
+    def _on_downloaded(self, path: str) -> None:
+        self.lbl_state.setText("Download verificato. Installazione e riavvio...")
+        exe = _current_exe()
+        try:
+            _install_update(pathlib.Path(path), exe)
+            _launch_detached(exe)
+        except OSError as e:
+            self._on_failed(f"impossibile sostituire {exe.name}: {e}")
+            return
+        self.accept()
+        QApplication.instance().quit()
+
+    @Slot(str)
+    def _on_failed(self, err: str) -> None:
+        self.prog.hide()
+        self.lbl_state.setText(f"Aggiornamento non riuscito: {err}\nPuoi scaricarlo dalla pagina della release.")
+        self.btn_download.setEnabled(True)
+        self.btn_page.setEnabled(True)
+        self.btn_close.setText("Chiudi")
+
+    def done(self, result: int) -> None:
+        if self._downloader is not None and self._downloader.isRunning():
+            self._downloader.cancel.set()
+        super().done(result)
 
 
 # --- MAIN APPLICATION WINDOW ---
@@ -1612,6 +1840,9 @@ class LanScannerWindow(QMainWindow):
         self._populate_network_adapters()
 
         QTimer.singleShot(2500, lambda: self.check_for_updates(manual=False))
+        # Il processo della versione precedente può impiegare qualche secondo a chiudersi e liberare il .old
+        _cleanup_previous_update()
+        QTimer.singleShot(8000, _cleanup_previous_update)
 
     def _load_device_notes(self) -> None:
         raw = self.settings.value("device_notes", "{}")
@@ -2574,9 +2805,7 @@ class LanScannerWindow(QMainWindow):
             self.lbl_status_msg.setText("Verifica aggiornamenti su GitHub in corso...")
 
         self.update_checker = UpdateCheckerThread(APP_VERSION, self)
-        self.update_checker.update_found.connect(
-            lambda tag, url, notes: self._on_update_found(tag, url, notes)
-        )
+        self.update_checker.update_found.connect(self._on_update_found)
         self.update_checker.no_update_found.connect(
             lambda ver: self._on_no_update(ver, manual)
         )
@@ -2585,9 +2814,9 @@ class LanScannerWindow(QMainWindow):
         )
         self.update_checker.start()
 
-    def _on_update_found(self, tag_version: str, download_url: str, release_notes: str) -> None:
+    def _on_update_found(self, tag_version: str, download_url: str, release_notes: str, asset: object) -> None:
         self.lbl_status_msg.setText(f"Nuova versione disponibile: {tag_version}")
-        _exec_dialog(UpdateDialog(tag_version, download_url, release_notes, self))
+        _exec_dialog(UpdateDialog(tag_version, download_url, release_notes, asset or None, self))
 
     def _on_no_update(self, current_ver: str, manual: bool) -> None:
         self.lbl_status_msg.setText(f"{APP_NAME} v{current_ver} è aggiornato all'ultima versione.")

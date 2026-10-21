@@ -245,3 +245,94 @@ def test_html_report_escapes_network_data(app, tmp_path, monkeypatch):
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
     assert "<script>alert(1)" not in text
     w.close()
+
+
+# --- aggiornamento automatico ---
+
+def test_pick_update_asset():
+    release = {"assets": [
+        {"name": "LanScanner_Setup_v9.exe", "browser_download_url": "https://x/setup.exe", "size": 5},
+        {"name": "LanScanner.exe", "browser_download_url": "https://x/LanScanner.exe", "size": 10,
+         "digest": "sha256:ABCDEF"},
+    ]}
+    assert s._pick_update_asset(release) == {"url": "https://x/LanScanner.exe", "size": 10, "sha256": "abcdef"}
+    assert s._pick_update_asset({"assets": []}) is None
+
+
+@pytest.fixture()
+def http_file(tmp_path):
+    import functools
+    import http.server
+
+    payload = b"MZ" + os.urandom(300_000)
+    (tmp_path / "srv").mkdir()
+    (tmp_path / "srv" / "LanScanner.exe").write_bytes(payload)
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(tmp_path / "srv"))
+    handler.log_message = lambda *a, **k: None
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    import threading
+
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}/LanScanner.exe", payload
+    srv.shutdown()
+
+
+def test_download_update_verifies_checksum(tmp_path, http_file):
+    import hashlib
+
+    url, payload = http_file
+    good = {"url": url, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+    seen = []
+    out = s._download_update(good, tmp_path / "new.exe", progress=lambda d, t: seen.append((d, t)))
+    assert out.read_bytes() == payload
+    assert seen[-1] == (len(payload), len(payload))
+
+    bad = dict(good, sha256="0" * 64)
+    with pytest.raises(RuntimeError, match="SHA-256"):
+        s._download_update(bad, tmp_path / "bad.exe")
+    assert not (tmp_path / "bad.exe").exists() and not (tmp_path / "bad.exe.part").exists()
+
+    with pytest.raises(RuntimeError, match="incompleto"):
+        s._download_update(dict(good, size=len(payload) + 1, sha256=""), tmp_path / "short.exe")
+
+
+def test_install_update_swaps_files(tmp_path):
+    cur = tmp_path / "LanScanner.exe"
+    new = tmp_path / "LanScanner.exe.download"
+    cur.write_bytes(b"MZ-old")
+    new.write_bytes(b"MZ-new")
+    old = s._install_update(new, cur)
+    assert cur.read_bytes() == b"MZ-new"
+    assert old.read_bytes() == b"MZ-old" and old.name == "LanScanner.exe.old"
+    assert not new.exists()
+
+
+# --- MAC su più IP ---
+
+def test_scan_marks_previous_dhcp_ip_not_conflict(app, monkeypatch):
+    mac = "A0:48:1C:76:C1:C8"
+    monkeypatch.setattr(s, "_arp_map", lambda: {"192.168.0.33": mac, "192.168.0.20": mac})
+    monkeypatch.setattr(s, "_ping_one", lambda ip, t=750: (ip == "192.168.0.33", 1.0))
+    monkeypatch.setattr(s, "_resolve_hostname", lambda ip: "DESKTOP-9LIEEHL")
+    monkeypatch.setattr(s.time, "sleep", lambda x: None)
+    w = s.ScanWorkerThread(["192.168.0.20", "192.168.0.33"], {})
+    hints = {}
+    w.hostname_resolved.connect(lambda ip, hn, hint, note: hints.__setitem__(ip, hint))
+    w.run()
+    assert "MAC su" not in hints["192.168.0.33"]
+    assert hints["192.168.0.20"].startswith("IP precedente di 192.168.0.33?")
+
+
+def test_scan_flags_two_alive_ips_with_same_mac(app, monkeypatch):
+    mac = "A0:48:1C:76:C1:C8"
+    monkeypatch.setattr(s, "_arp_map", lambda: {"10.0.0.1": mac, "10.0.0.2": mac})
+    monkeypatch.setattr(s, "_ping_one", lambda ip, t=750: (True, 1.0))
+    monkeypatch.setattr(s, "_resolve_hostname", lambda ip: "")
+    monkeypatch.setattr(s, "_resolve_mdns_name", lambda ip: "")
+    monkeypatch.setattr(s, "_probe_ssdp_info", lambda ip: "")
+    monkeypatch.setattr(s.time, "sleep", lambda x: None)
+    w = s.ScanWorkerThread(["10.0.0.1", "10.0.0.2"], {})
+    hints = {}
+    w.hostname_resolved.connect(lambda ip, hn, hint, note: hints.__setitem__(ip, hint))
+    w.run()
+    assert all("MAC su 2 IP attivi" in h for h in hints.values())

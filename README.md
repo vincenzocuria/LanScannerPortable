@@ -1,10 +1,15 @@
-# LanScanner v1.3.1 — Network Scanner Portatile per Windows
+# LanScanner v1.3.2 — Network Scanner Portatile per Windows
 
 **LanScanner** è uno strumento leggero, veloce e moderno per la scansione ed esplorazione degli host attivi sulla rete locale (LAN IPv4).
 
 Realizzato in Python con interfaccia grafica **PySide6 (Qt 6)** e design **Material 3 Expressive**.
 
 ---
+
+## ⬇️ Novità v1.3.2
+
+- **Aggiornamento automatico**: quando esce una nuova versione, "Aggiorna e riavvia" scarica `LanScanner.exe` dalla release GitHub, ne verifica dimensione e SHA-256, sostituisce l'exe in uso e riavvia l'app. Il file della versione precedente viene cancellato al primo avvio successivo.
+- "MAC su più IP" segnalato solo se gli IP con lo stesso MAC rispondono entrambi al ping. Un IP rimasto solo nella cache ARP con il MAC di un host attivo è indicato come "IP precedente di …" (tipico cambio di indirizzo DHCP), non più come conflitto.
 
 ## 🔧 Novità v1.3.1 (correzioni)
 
@@ -61,9 +66,9 @@ python build_exe.py
 ```
 
 ### 4. Generazione dell'Installer Windows (Inno Setup)
-Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.3.1.exe`.
+Compilando lo script `installer.iss` tramite [Inno Setup](https://jrsoftware.org/isinfo.php), verrà generato l'installatore guidato in italiano `dist/LanScanner_Setup_v1.3.2.exe`.
 
-L'eseguibile e l'installer si pubblicano come asset delle [Release GitHub](https://github.com/vincenzocuria/LanScannerPortable/releases), non nel repository.
+L'eseguibile e l'installer si pubblicano come asset delle [Release GitHub](https://github.com/vincenzocuria/LanScannerPortable/releases), non nel repository. L'aggiornamento automatico e il pulsante di download su vcuria.app cercano un asset chiamato esattamente `LanScanner.exe`: va allegato a ogni release.
 
 ### 5. Aggiornamento del database produttori
 ```bash
