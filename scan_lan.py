@@ -18,6 +18,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -46,6 +47,8 @@ from PySide6.QtGui import (
     QFont,
     QIcon,
     QKeySequence,
+    QPageLayout,
+    QTextDocument,
 )
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
@@ -79,6 +82,7 @@ APP_COMPANY = "NGV Group S.R.L."
 APP_DEVELOPER = "Vincenzo Curia"
 GITHUB_REPO = "vincenzocuria/LanScannerPortable"
 WEBSITE_URL = "https://vcuria.app"
+SETTINGS_ORG = "NGVGroup"  # chiave HKCU\Software\NGVGroup\LanScanner; i test ne usano una separata
 
 COLS = ("ip", "ping", "mac", "vendor", "host", "hint", "note")
 COL_HEADERS = ["IP", "Stato Ping / Rilevamento", "MAC", "Vendor (OUI)", "Hostname", "Indizio / Tipo", "Note Utente"]
@@ -297,6 +301,13 @@ def _get_network_interfaces() -> List[Tuple[str, str, int]]:
     return interfaces
 
 
+def _host_bounds(net: ipaddress.IPv4Network) -> Tuple[str, str, int]:
+    """Primo e ultimo host utile e loro numero, senza generare la lista (una /8 sono 16 milioni)."""
+    if net.prefixlen >= 31:  # /31 punto-punto (RFC 3021) e /32: tutti gli indirizzi sono utili
+        return str(net.network_address), str(net.broadcast_address), net.num_addresses
+    return str(net.network_address + 1), str(net.broadcast_address - 1), net.num_addresses - 2
+
+
 def _default_range_for_ip(ip: str, prefix: int = 24) -> Tuple[str, str]:
     try:
         addr = ipaddress.IPv4Address(ip)
@@ -459,20 +470,45 @@ def _arp_map() -> Dict[str, str]:
         return {}
 
 
-def _send_wol(mac: str) -> bool:
-    """Invia un pacchetto WoL Magic Packet in broadcast UDP alla porta 9 per il MAC specificato."""
-    try:
-        clean_mac = mac.replace(":", "").replace("-", "").replace(" ", "").upper()
-        if len(clean_mac) != 12:
-            return False
-        data = bytes.fromhex("FF" * 6 + clean_mac * 16)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.sendto(data, ("255.255.255.255", 9))
-        sock.close()
-        return True
-    except Exception:
+def _wol_packet(mac: str) -> Optional[bytes]:
+    clean_mac = re.sub(r"[^0-9A-Fa-f]", "", mac)
+    if len(clean_mac) != 12:
+        return None
+    return bytes.fromhex("FF" * 6 + clean_mac * 16)
+
+
+def _send_wol(mac: str, interfaces: Optional[List[Tuple[str, str, int]]] = None) -> bool:
+    """Invia il Magic Packet su ogni scheda di rete (porte UDP 9 e 7).
+
+    Con più schede (VPN, Hyper-V, Wi-Fi + cavo) il broadcast 255.255.255.255 esce da una sola:
+    per questo si invia da ogni indirizzo locale sia il broadcast generico sia quello della sua subnet.
+    """
+    data = _wol_packet(mac)
+    if data is None:
         return False
+    if interfaces is None:
+        interfaces = _get_network_interfaces()
+    targets: List[Tuple[str, str]] = [("", "255.255.255.255")]
+    for _name, ip, prefix in interfaces:
+        try:
+            net = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+        except ValueError:
+            continue
+        targets.append((ip, "255.255.255.255"))
+        targets.append((ip, str(net.broadcast_address)))
+    sent = 0
+    for src, dst in dict.fromkeys(targets):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                if src:
+                    sock.bind((src, 0))
+                for port in (9, 7):
+                    sock.sendto(data, (dst, port))
+                    sent += 1
+        except OSError:
+            continue
+    return sent > 0
 
 
 def _resolve_hostname(ip: str) -> str:
@@ -892,13 +928,18 @@ class ContinuousPingWorker(QThread):
 
 
 _TRACERT_HOP_RE = re.compile(r"^\s*(\d+)\s+((?:(?:<?\d+\s*ms|\*)\s+){1,3})(\d{1,3}(?:\.\d{1,3}){3})")
+_TRACERT_TIMEOUT_RE = re.compile(r"^\s*(\d+)\s+\*\s+\*\s+\*")
 
 
 def _parse_tracert_line(line: str) -> Optional[Tuple[int, str, float]]:
-    """Riconosce una riga di tracert -d: (hop, ip, media RTT in ms) oppure None."""
+    """Riconosce una riga di tracert -d: (hop, ip, media RTT in ms) oppure None.
+
+    Un hop che non risponde (* * *) restituisce ip "*" e RTT -1.
+    """
     m = _TRACERT_HOP_RE.search(line)
     if not m:
-        return None
+        t = _TRACERT_TIMEOUT_RE.search(line)
+        return (int(t.group(1)), "*", -1.0) if t else None
     rtts = [float(x) for x in re.findall(r"<?(\d+)\s*ms", m.group(2))]
     avg_rtt = round(sum(rtts) / len(rtts), 1) if rtts else 0.0
     return int(m.group(1)), m.group(3), avg_rtt
@@ -906,6 +947,7 @@ def _parse_tracert_line(line: str) -> Optional[Tuple[int, str, float]]:
 
 class TracerouteWorker(QThread):
     hop_found = Signal(int, str, float, str)
+    hop_named = Signal(int, str)
     trace_finished = Signal()
 
     def __init__(self, target_ip: str, max_hops: int = 30, parent=None):
@@ -924,7 +966,14 @@ class TracerouteWorker(QThread):
             except OSError:
                 pass
 
+    def _name_hop(self, hop_n: int, ip: str) -> None:
+        name = _resolve_hostname(ip)
+        if name and self._running:
+            self.hop_named.emit(hop_n, name)
+
     def run(self) -> None:
+        # I nomi si risolvono a parte: un hop senza PTR costa fino a ~6 s e bloccava la lettura di tracert
+        names = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         try:
             cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             self._proc = subprocess.Popen(
@@ -942,13 +991,22 @@ class TracerouteWorker(QThread):
                 hop = _parse_tracert_line(line)
                 if hop:
                     hop_n, ip, avg_rtt = hop
-                    self.hop_found.emit(hop_n, ip, avg_rtt, _resolve_hostname(ip))
+                    self.hop_found.emit(hop_n, ip, avg_rtt, "")
+                    if ip != "*":
+                        names.submit(self._name_hop, hop_n, ip)
                     if ip == self.target_ip:
                         break
         except Exception:
             pass
         finally:
-            self.stop()
+            proc = self._proc
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            # Interrotto dall'utente: niente attesa; completato: si aspettano i nomi ancora in corso
+            names.shutdown(wait=self._running, cancel_futures=not self._running)
         self.trace_finished.emit()
 
 
@@ -1133,19 +1191,29 @@ class SubnetCalculatorDialog(QDialog):
             if "/" not in raw:
                 raw += "/24"
             net = ipaddress.IPv4Network(raw, strict=False)
-            hosts = list(net.hosts())
-            first_host = str(hosts[0]) if hosts else "N/A"
-            last_host = str(hosts[-1]) if hosts else "N/A"
+            first_host, last_host, usable = _host_bounds(net)
+            if net.is_private:
+                kind = "Privato (LAN)"
+            elif net.is_loopback:
+                kind = "Loopback"
+            elif net.is_link_local:
+                kind = "Link-local (APIPA)"
+            elif net.is_multicast:
+                kind = "Multicast"
+            else:
+                kind = "Pubblico (WAN)"
 
             info = [
                 f"Rete CIDR:           {net.with_prefixlen}",
                 f"Maschera Subnet:     {net.netmask}",
+                f"Wildcard (ACL):      {net.hostmask}",
                 f"Indirizzo Rete:      {net.network_address}",
                 f"Indirizzo Broadcast: {net.broadcast_address}",
-                f"Host Utili Totali:   {net.num_addresses - 2 if net.prefixlen <= 30 else net.num_addresses}",
+                f"Host Utili Totali:   {usable:,}".replace(",", "."),
                 f"Primo Host Utile:    {first_host}",
                 f"Ultimo Host Utile:   {last_host}",
-                f"Tipo Indirizzo:      {'Privato (LAN)' if net.is_private else 'Pubblico (WAN)'}",
+                f"Tipo Indirizzo:      {kind}",
+                f"Scansionabile:       {'Sì' if usable <= MAX_SCAN_HOSTS else f'No (oltre {MAX_SCAN_HOSTS} host)'}",
             ]
             self.txt_info.setText("\n".join(info))
         except Exception as e:
@@ -1308,7 +1376,9 @@ class TracerouteDialog(QDialog):
         self.worker = TracerouteWorker(target_ip)
         _keep_alive(self.worker)
         self.worker.hop_found.connect(self._on_hop_found)
+        self.worker.hop_named.connect(self._on_hop_named)
         self.worker.trace_finished.connect(self._on_finished)
+        self._hop_items: Dict[int, QTreeWidgetItem] = {}
         self.worker.start()
 
     def done(self, result: int) -> None:
@@ -1317,9 +1387,18 @@ class TracerouteDialog(QDialog):
         super().done(result)
 
     def _on_hop_found(self, hop: int, ip: str, rtt: float, hostname: str) -> None:
-        rtt_str = f"{rtt:.1f} ms" if rtt > 0 else "<1 ms"
-        item = QTreeWidgetItem(self.table, [str(hop), ip, rtt_str, hostname or "—"])
+        if ip == "*":
+            row = [str(hop), "*", "timeout", "(nessuna risposta)"]
+        else:
+            row = [str(hop), ip, f"{rtt:.1f} ms" if rtt > 0 else "<1 ms", hostname or "—"]
+        item = QTreeWidgetItem(self.table, row)
         item.setTextAlignment(0, Qt.AlignCenter)
+        self._hop_items[hop] = item
+
+    def _on_hop_named(self, hop: int, hostname: str) -> None:
+        item = self._hop_items.get(hop)
+        if item is not None:
+            item.setText(3, hostname)
 
     def _on_finished(self) -> None:
         self.btn_toggle.setEnabled(False)
@@ -1411,7 +1490,16 @@ class ContinuousPingDialog(QDialog):
         self.card_sent.setText(f"Inviati: <b>{self.sent_count}</b>")
         self.card_recv.setText(f"Ricevuti: <b>{self.recv_count}</b>")
         self.card_loss.setText(f"Persi: <b>{loss_pct}%</b>")
-        self.card_rtt.setText(f"Latenza Media: <b>{avg_rtt} ms</b>" if self.rtt_list else "Latenza: -")
+        if self.rtt_list:
+            # IcmpSendEcho dà 0 per le risposte sotto il millisecondo
+            def fmt(v: float) -> str:
+                return "&lt;1" if v < 1 else f"{v:g}"
+
+            self.card_rtt.setText(
+                f"Media <b>{fmt(avg_rtt)} ms</b> · min {fmt(min(self.rtt_list))} · max {fmt(max(self.rtt_list))}"
+            )
+        else:
+            self.card_rtt.setText("Latenza: -")
 
     def _start_worker(self) -> None:
         self.worker = ContinuousPingWorker(self.target_ip, interval_sec=1.0)
@@ -1816,6 +1904,29 @@ class UpdateDialog(QDialog):
 
 # --- MAIN APPLICATION WINDOW ---
 
+class ResultItem(QTreeWidgetItem):
+    """Riga dei risultati con ordinamento numerico per IP (colonna 0) e latenza (colonna 1)."""
+
+    @staticmethod
+    def _key(text: str, column: int):
+        if column == 0:
+            try:
+                return (0, int(ipaddress.IPv4Address(text)))
+            except ValueError:
+                return (1, text)
+        if column == 1:
+            m = re.search(r"\((<?)(\d+) ms\)", text)
+            if m:
+                return (0, 0 if m.group(1) else int(m.group(2)))
+            return (1, text)  # "Solo ARP" dopo gli host che rispondono al ping
+        return (0, text.lower()) if text not in ("—", "...") else (1, "")
+
+    def __lt__(self, other: QTreeWidgetItem) -> bool:
+        tree = self.treeWidget()
+        column = tree.sortColumn() if tree is not None else 0
+        return self._key(self.text(column), column) < self._key(other.text(column), column)
+
+
 class LanScannerWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1825,11 +1936,12 @@ class LanScannerWindow(QMainWindow):
 
         _set_window_icon(self)
 
-        self.settings = QSettings("NGVGroup", "LanScanner")
+        self.settings = QSettings(SETTINGS_ORG, "LanScanner")
         self.theme_mode = self.settings.value("theme_mode", "auto")
         self.scan_worker: Optional[ScanWorkerThread] = None
         self.update_checker: Optional[UpdateCheckerThread] = None
         self._row_items: Dict[str, QTreeWidgetItem] = {}
+        self._new_devices = 0
 
         self._load_device_notes()
 
@@ -1951,6 +2063,10 @@ class LanScannerWindow(QMainWindow):
         self.act_export_html.triggered.connect(self._export_html_dialog)
         menu_file.addAction(self.act_export_html)
 
+        self.act_export_pdf = QAction("📕 Esporta Report PDF...", self)
+        self.act_export_pdf.triggered.connect(self._export_pdf_action)
+        menu_file.addAction(self.act_export_pdf)
+
         self.act_print = QAction("🖨️ Stampa Report...", self)
         self.act_print.setShortcut(QKeySequence.Print)
         self.act_print.triggered.connect(self._print_report)
@@ -2017,6 +2133,11 @@ class LanScannerWindow(QMainWindow):
         act_detail = QAction("🔍 Dettaglio Dispositivo...", self)
         act_detail.triggered.connect(self._open_detail_selected)
         menu_tools.addAction(act_detail)
+
+        menu_tools.addSeparator()
+        act_reset_known = QAction("🆕 Azzera elenco dispositivi conosciuti", self)
+        act_reset_known.triggered.connect(self._reset_known_macs)
+        menu_tools.addAction(act_reset_known)
 
         # Help Menu
         menu_help = menu_bar.addMenu("&?")
@@ -2229,6 +2350,9 @@ class LanScannerWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.setRootIsDecorated(False)
         self.table.setUniformRowHeights(True)
+        # Clic sull'intestazione per ordinare; IP e latenza in ordine numerico (vedi ResultItem)
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(0, Qt.AscendingOrder)
 
         header = self.table.header()
         for idx, width in enumerate(COL_WIDTHS):
@@ -2292,9 +2416,8 @@ class LanScannerWindow(QMainWindow):
         if "/" in txt:
             try:
                 net = ipaddress.IPv4Network(txt, strict=False)
-                hosts = list(net.hosts())
-                if hosts:
-                    self.txt_ip_end.setText(str(hosts[-1]))
+                # Calcolo diretto: con list(net.hosts()) scrivere "/8" bloccava la finestra per ~10 s
+                self.txt_ip_end.setText(_host_bounds(net)[1])
             except ValueError:
                 pass
 
@@ -2320,6 +2443,10 @@ class LanScannerWindow(QMainWindow):
         self._start_scan()
 
     def _start_scan(self) -> None:
+        if self.scan_worker and self.scan_worker.isRunning():
+            # Ctrl+R / menu durante una scansione: due worker scriverebbero righe doppie nella tabella
+            self.lbl_status_msg.setText("Scansione già in corso: usa 🛑 Interrompi per fermarla.")
+            return
         s0 = self.txt_ip_start.text().strip()
         s1 = self.txt_ip_end.text().strip()
 
@@ -2360,9 +2487,23 @@ class LanScannerWindow(QMainWindow):
 
     @Slot(list)
     def _on_initial_alive(self, rows: List[Tuple[str, str, str, str, str, str, str]]) -> None:
+        known = self._known_macs()
+        self._new_devices = 0
         for r in rows:
-            item = QTreeWidgetItem(self.table, list(r))
+            values = list(r)
+            mac = values[2]
+            # Al primo utilizzo l'elenco è vuoto: non si segnalano come nuovi tutti i dispositivi
+            is_new = bool(known) and mac != "—" and mac not in known
+            if is_new:
+                values[1] += " · 🆕 Nuovo"
+                self._new_devices += 1
+            item = ResultItem(self.table, values)
             item.setTextAlignment(1, Qt.AlignCenter)
+            if is_new:
+                font = item.font(0)
+                font.setBold(True)
+                for c in range(len(values)):
+                    item.setFont(c, font)
             self._row_items[r[0]] = item
         self._apply_filter(self.txt_filter.text())
         self.lbl_status_msg.setText(f"Trovati {len(rows)} host: risoluzione nomi in corso...")
@@ -2386,12 +2527,38 @@ class LanScannerWindow(QMainWindow):
         self.prog_bar.setValue(self.prog_bar.maximum())
         self.btn_scan.setText("🔍 Scansiona")
         self.btn_scan.setEnabled(True)
-        self.lbl_status_msg.setText(f"Scansione completata con successo: trovati {total_alive} host attivi nella LAN.")
+        first_time = not self._known_macs()
+        self._remember_macs(item.text(2) for item in self._row_items.values())
+        msg = f"Scansione completata: trovati {total_alive} host attivi."
+        if self._new_devices:
+            msg += f" 🆕 {self._new_devices} dispositivi mai visti prima (in grassetto)."
+        elif first_time and total_alive:
+            msg += " Dispositivi memorizzati: dalla prossima scansione quelli nuovi saranno evidenziati."
+        self.lbl_status_msg.setText(msg)
+
+    # --- DISPOSITIVI CONOSCIUTI ---
+    def _known_macs(self) -> set:
+        raw = self.settings.value("known_macs", "[]")
+        try:
+            return set(json.loads(raw) if isinstance(raw, str) else raw)
+        except (TypeError, ValueError):
+            return set()
+
+    def _remember_macs(self, macs) -> None:
+        known = self._known_macs() | {m for m in macs if m and m != "—"}
+        self.settings.setValue("known_macs", json.dumps(sorted(known)))
+
+    def _reset_known_macs(self) -> None:
+        self.settings.setValue("known_macs", "[]")
+        self.lbl_status_msg.setText("Elenco dispositivi conosciuti azzerato: la prossima scansione diventa il riferimento.")
 
     @Slot()
     def _on_scan_interrupted(self) -> None:
         self.btn_scan.setText("🔍 Scansiona")
         self.btn_scan.setEnabled(True)
+        for item in self._row_items.values():
+            if item.text(4) == "...":
+                item.setText(4, "—")
         self.lbl_status_msg.setText("Scansione interrotta dall'utente.")
 
     @Slot(str)
@@ -2478,6 +2645,9 @@ class LanScannerWindow(QMainWindow):
         act_exp_html = menu.addAction("🌐 Esporta Report HTML Interattivo")
         act_exp_html.triggered.connect(lambda: self._export_html_action(only_selected=False))
 
+        act_exp_pdf = menu.addAction("📕 Esporta Report PDF")
+        act_exp_pdf.triggered.connect(self._export_pdf_action)
+
         menu.addSeparator()
         act_info = menu.addAction("ℹ️ Informazioni e Crediti")
         act_info.triggered.connect(lambda: _exec_dialog(AboutDialog(self)))
@@ -2492,9 +2662,30 @@ class LanScannerWindow(QMainWindow):
             QMessageBox.critical(self, "RDP", f"Impossibile avviare RDP: {e}")
 
     def _launch_ssh(self, ip: str) -> None:
+        if not shutil.which("ssh"):
+            QMessageBox.warning(
+                self,
+                "SSH",
+                "Client SSH non trovato.\nInstallalo da Impostazioni → App → Funzionalità facoltative → Client OpenSSH.",
+            )
+            return
+        last_user = str(self.settings.value("ssh_user", "") or "")
+        user, ok = QInputDialog.getText(
+            self, "Terminale SSH", f"Utente per {ip} (vuoto = utente corrente):", QLineEdit.Normal, last_user
+        )
+        if not ok:
+            return
+        user = user.strip()
+        # Il comando passa da cmd.exe: solo caratteri sicuri nel nome utente
+        if user and not re.fullmatch(r"[A-Za-z0-9._\\@-]{1,64}", user):
+            QMessageBox.warning(self, "SSH", "Nome utente non valido.")
+            return
+        self.settings.setValue("ssh_user", user)
+        target = f"{user}@{ip}" if user else ip
         try:
-            subprocess.Popen(["cmd.exe", "/c", "start", "cmd.exe", "/k", f"ssh {ip}"])
-            self.lbl_status_msg.setText(f"Avviata sessione SSH per {ip}...")
+            ipaddress.IPv4Address(ip)
+            subprocess.Popen(["cmd.exe", "/c", "start", "cmd.exe", "/k", "ssh", target])
+            self.lbl_status_msg.setText(f"Avviata sessione SSH per {target}...")
         except Exception as e:
             QMessageBox.critical(self, "SSH", f"Impossibile aprire il terminale SSH: {e}")
 
@@ -2762,38 +2953,72 @@ class LanScannerWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Errore Esportazione", f"Impossibile salvare il report HTML: {e}")
 
-    def _print_report(self) -> None:
+    def _report_document(self) -> Optional[QTextDocument]:
+        """Report della tabella (nell'ordine mostrato) per stampa ed export PDF."""
         root = self.table.invisibleRootItem()
         count = root.childCount()
         if count == 0:
+            return None
+        parts = [
+            f"<h2>{APP_NAME} — Report Scansione LAN</h2>",
+            f"<p><b>Data:</b> {time.strftime('%d/%m/%Y %H:%M')} | <b>Host Trovati:</b> {count} | "
+            f"<b>Intervallo:</b> {html.escape(self.txt_ip_start.text())} – {html.escape(self.txt_ip_end.text())}</p>",
+            "<table border='1' cellspacing='0' cellpadding='4' width='100%' style='border-collapse:collapse; font-family: Segoe UI, sans-serif; font-size: 8pt;'>",
+            "<tr bgcolor='#f1f5f9'>" + "".join(f"<th>{h}</th>" for h in COL_HEADERS) + "</tr>",
+        ]
+        for i in range(count):
+            item = root.child(i)
+            bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
+            parts.append(f"<tr bgcolor='{bg}'>")
+            for c in range(item.columnCount()):
+                parts.append(f"<td>{html.escape(item.text(c))}</td>")
+            parts.append("</tr>")
+        parts.append("</table>")
+        parts.append(f"<p><small>{APP_COMPANY} — Sviluppatore: {APP_DEVELOPER} ({WEBSITE_URL})</small></p>")
+        doc = QTextDocument()
+        doc.setHtml("".join(parts))
+        return doc
+
+    @staticmethod
+    def _landscape_printer(printer: QPrinter) -> QPrinter:
+        # 7 colonne non stanno in verticale su A4
+        printer.setPageOrientation(QPageLayout.Landscape)
+        return printer
+
+    def _print_report(self) -> None:
+        doc = self._report_document()
+        if doc is None:
             QMessageBox.warning(self, "Stampa", "Nessun dato disponibile da stampare.")
             return
-
-        printer = QPrinter(QPrinter.HighResolution)
+        printer = self._landscape_printer(QPrinter(QPrinter.HighResolution))
         dialog = QPrintDialog(printer, self)
         if dialog.exec() == QPrintDialog.Accepted:
-            parts = [
-                f"<h2>{APP_NAME} — Report Scansione LAN</h2>",
-                f"<p><b>Data:</b> {time.strftime('%d/%m/%Y %H:%M')} | <b>Host Trovati:</b> {count}</p>",
-                "<table border='1' cellspacing='0' cellpadding='5' style='border-collapse:collapse; width:100%; font-family: Segoe UI, sans-serif;'>",
-                "<tr bgcolor='#f1f5f9'>" + "".join(f"<th>{h}</th>" for h in COL_HEADERS) + "</tr>",
-            ]
-
-            for i in range(count):
-                item = root.child(i)
-                bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
-                parts.append(f"<tr bgcolor='{bg}'>")
-                for c in range(item.columnCount()):
-                    parts.append(f"<td>{html.escape(item.text(c))}</td>")
-                parts.append("</tr>")
-
-            parts.append("</table>")
-            parts.append(f"<p><small>{APP_COMPANY} — Sviluppatore: {APP_DEVELOPER} ({WEBSITE_URL})</small></p>")
-
-            doc = QTextEdit()
-            doc.setHtml("".join(parts))
             doc.print_(printer)
             self.lbl_status_msg.setText("Report inviato alla stampante.")
+
+    def _export_pdf_action(self) -> None:
+        doc = self._report_document()
+        if doc is None:
+            QMessageBox.warning(self, "Esporta PDF", "Nessun dato presente da esportare.")
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Esporta Report PDF", f"LanScanner_Report_{time.strftime('%Y%m%d_%H%M')}.pdf", "File PDF (*.pdf)"
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith(".pdf"):
+            filename += ".pdf"
+        try:
+            printer = self._landscape_printer(QPrinter(QPrinter.HighResolution))
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(filename)
+            doc.print_(printer)
+            if not os.path.isfile(filename) or os.path.getsize(filename) == 0:
+                raise OSError("file PDF non creato")
+            self.lbl_status_msg.setText(f"Esportazione PDF completata: {filename}")
+            QMessageBox.information(self, "Esportazione PDF", f"Report PDF salvato:\n{filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Errore Esportazione", f"Impossibile salvare il PDF: {e}")
 
     # --- UPDATER ---
 

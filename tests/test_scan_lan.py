@@ -35,6 +35,16 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def isolated_settings(monkeypatch):
+    """Le impostazioni dei test vanno in una chiave a parte, non in quella dell'utente."""
+    from PySide6.QtCore import QSettings
+
+    monkeypatch.setattr(s, "SETTINGS_ORG", "NGVGroup-LanScanner-test")
+    yield
+    QSettings("NGVGroup-LanScanner-test", "LanScanner").clear()
+
+
 # --- mDNS ---
 
 @pytest.mark.parametrize("repeat_question", [True, False])
@@ -123,7 +133,41 @@ Interfaccia: 192.168.10.6 --- 0xc
 def test_parse_tracert_line():
     assert s._parse_tracert_line("  1    <1 ms    <1 ms    <1 ms  192.168.10.1") == (1, "192.168.10.1", 1.0)
     assert s._parse_tracert_line("  3    12 ms    14 ms     *     10.0.0.1") == (3, "10.0.0.1", 13.0)
-    assert s._parse_tracert_line("  4     *        *        *     Richiesta scaduta.") is None
+    assert s._parse_tracert_line("  4     *        *        *     Richiesta scaduta.") == (4, "*", -1.0)
+    assert s._parse_tracert_line("Rilevazione instradamento verso 1.1.1.1") is None
+
+
+def test_host_bounds_is_instant_for_huge_networks():
+    import ipaddress
+
+    t0 = time.perf_counter()
+    assert s._host_bounds(ipaddress.IPv4Network("10.0.0.0/8")) == ("10.0.0.1", "10.255.255.254", 16777214)
+    assert time.perf_counter() - t0 < 0.05
+    assert s._host_bounds(ipaddress.IPv4Network("10.0.0.0/31")) == ("10.0.0.0", "10.0.0.1", 2)
+    assert s._host_bounds(ipaddress.IPv4Network("10.0.0.7/32")) == ("10.0.0.7", "10.0.0.7", 1)
+
+
+def test_wol_packet_and_send():
+    pkt = s._wol_packet("aa-bb-cc-dd-ee-ff")
+    assert len(pkt) == 102 and pkt[:6] == b"\xff" * 6 and pkt[6:12] == bytes.fromhex("aabbccddeeff")
+    assert s._wol_packet("nonvalido") is None
+    assert s._send_wol("AA:BB:CC:DD:EE:FF", interfaces=[("lo", "127.0.0.1", 8)])
+
+
+def test_result_item_sorts_ip_and_latency_numerically(app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTreeWidget
+
+    t = QTreeWidget()
+    t.setColumnCount(2)
+    t.setSortingEnabled(True)
+    for ip, st in [("192.168.1.10", "🟢 Attivo (12 ms)"), ("192.168.1.9", "🟡 Solo ARP (no ping)"),
+                   ("192.168.1.100", "🟢 Attivo (<1 ms)")]:
+        s.ResultItem(t, [ip, st])
+    t.sortByColumn(0, Qt.AscendingOrder)
+    assert [t.topLevelItem(i).text(0) for i in range(3)] == ["192.168.1.9", "192.168.1.10", "192.168.1.100"]
+    t.sortByColumn(1, Qt.AscendingOrder)
+    assert [t.topLevelItem(i).text(0) for i in range(3)] == ["192.168.1.100", "192.168.1.10", "192.168.1.9"]
 
 
 # --- porte, OUI, hint, SSDP ---
@@ -244,6 +288,39 @@ def test_html_report_escapes_network_data(app, tmp_path, monkeypatch):
     text = out.read_text(encoding="utf-8")
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
     assert "<script>alert(1)" not in text
+    w.close()
+
+
+def test_pdf_export_and_known_devices(app, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    w = s.LanScannerWindow()
+    assert w.settings.fileName().endswith("NGVGroup-LanScanner-test\\LanScanner")
+    w._on_initial_alive([("10.0.0.1", "🟢 Attivo (1 ms)", "AA:AA:AA:00:00:01", "—", "...", "—", "—")])
+    w._on_scan_finished(1)
+    assert "AA:AA:AA:00:00:01" in w._known_macs()
+    w.table.clear()
+    w._row_items = {}
+    w._on_initial_alive([
+        ("10.0.0.1", "🟢 Attivo (1 ms)", "AA:AA:AA:00:00:01", "—", "...", "—", "—"),
+        ("10.0.0.2", "🟢 Attivo (1 ms)", "AA:AA:AA:00:00:02", "—", "...", "—", "—"),
+    ])
+    flags = {w.table.topLevelItem(i).text(0): "Nuovo" in w.table.topLevelItem(i).text(1) for i in range(2)}
+    assert flags == {"10.0.0.1": False, "10.0.0.2": True}
+
+    out = tmp_path / "report.pdf"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    w._export_pdf_action()
+    assert out.read_bytes()[:5] == b"%PDF-"
+    w.close()
+
+
+def test_interrupt_clears_name_placeholders(app):
+    w = s.LanScannerWindow()
+    w._on_initial_alive([("10.0.0.1", "🟢 Attivo (1 ms)", "—", "—", "...", "—", "—")])
+    w._on_scan_interrupted()
+    assert w.table.topLevelItem(0).text(4) == "—"
     w.close()
 
 
