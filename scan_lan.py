@@ -10,9 +10,10 @@ from __future__ import annotations
 import concurrent.futures
 import csv
 import ctypes
+import ctypes.wintypes
+import html
 import ipaddress
 import json
-import os
 import pathlib
 import re
 import socket
@@ -28,10 +29,7 @@ import zlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import (
-    QRect,
     QSettings,
-    QSignalBlocker,
-    QSize,
     QThread,
     QTimer,
     QUrl,
@@ -42,15 +40,10 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
-    QClipboard,
-    QColor,
-    QCursor,
     QDesktopServices,
     QFont,
     QIcon,
     QKeySequence,
-    QPainter,
-    QPixmap,
 )
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
@@ -59,28 +52,17 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
-    QFormLayout,
     QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
-    QMenuBar,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
-    QScrollArea,
-    QSizePolicy,
-    QSplitter,
-    QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
     QTextEdit,
     QToolButton,
     QTreeWidget,
@@ -90,7 +72,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "LanScanner"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 APP_COMPANY = "NGV Group S.R.L."
 APP_DEVELOPER = "Vincenzo Curia"
 GITHUB_REPO = "vincenzocuria/LanScannerPortable"
@@ -136,7 +118,8 @@ def _load_oui_map() -> Dict[str, str]:
                             continue
                         oui, _, name = line.partition("\t")
                         oui = oui.strip().upper()
-                        if len(oui) == 6:
+                        # 6 cifre esadecimali = MA-L (/24), 7 = MA-M (/28), 9 = MA-S (/36)
+                        if len(oui) in _OUI_PREFIX_LENGTHS:
                             m[oui] = name.strip()
                 except Exception:
                     m = {}
@@ -144,17 +127,27 @@ def _load_oui_map() -> Dict[str, str]:
         return _OUI_MAP
 
 
+_OUI_PREFIX_LENGTHS = (9, 7, 6)
+
+
 def _vendor_from_mac(mac: str) -> str:
     if not mac or mac == "—":
         return ""
-    m = mac.upper().replace("-", ":").replace(" ", "")
-    parts = [p for p in m.split(":") if p]
-    if len(parts) < 3:
+    hex_mac = re.sub(r"[^0-9A-Fa-f]", "", mac).upper()
+    if len(hex_mac) != 12:
         return ""
-    return _load_oui_map().get("".join(parts[:3]), "")
+    oui_map = _load_oui_map()
+    # Prefisso più lungo prima: i blocchi MA-M/MA-S sono assegnati a produttori diversi dal titolare del /24
+    for n in _OUI_PREFIX_LENGTHS:
+        vendor = oui_map.get(hex_mac[:n])
+        if vendor:
+            return vendor
+    return ""
 
 
-def _quick_hint(hostname: str, vendor: str, mac: str, mdns: str = "", ssdp: str = "") -> str:
+def _quick_hint(
+    hostname: str, vendor: str, mac: str, mdns: str = "", ssdp: str = "", mac_ip_count: int = 0
+) -> str:
     h = (hostname or "").lower()
     v = (vendor or "").lower()
     m_info = (mdns or "").lower()
@@ -163,6 +156,10 @@ def _quick_hint(hostname: str, vendor: str, mac: str, mdns: str = "", ssdp: str 
         h = ""
 
     hints: List[str] = []
+
+    if mac_ip_count > 1:
+        # Può essere un conflitto IP, un proxy ARP o un dispositivo con più indirizzi
+        hints.append(f"⚠️ MAC su {mac_ip_count} IP")
 
     if ssdp:
         hints.append(f"UPnP: {ssdp[:24]}")
@@ -213,50 +210,101 @@ def _local_ipv4() -> Optional[str]:
         return None
 
 
-def _get_network_interfaces() -> List[Tuple[str, str]]:
-    """Restituisce l'elenco delle schede di rete attive sul sistema (Nome, IP)."""
-    interfaces: List[Tuple[str, str]] = []
+MAX_SCAN_HOSTS = 4096
+
+_IPV4_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})")
+
+
+def _console_encoding() -> str:
+    """Codepage OEM della console: è quella usata da ipconfig, arp, tracert e nbtstat."""
+    if sys.platform == "win32":
+        try:
+            return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+        except Exception:
+            pass
+    return "cp850"
+
+
+def _run_console(cmd: List[str], timeout: float) -> str:
+    cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding=_console_encoding(),
+        errors="replace",
+        creationflags=cr,
+        timeout=timeout,
+    )
+    return (r.stdout or "") + (r.stderr or "")
+
+
+def _parse_ipconfig(output: str) -> List[Tuple[str, str, int]]:
+    """Estrae (scheda, IPv4, prefisso) dall'output di ipconfig in qualsiasi lingua.
+
+    Le intestazioni delle schede sono le righe non indentate che terminano con ":";
+    la maschera è il primo indirizzo che inizia con 255. dopo la riga IPv4.
+    """
+    interfaces: List[Tuple[str, str, int]] = []
+    adapter = "Scheda di rete"
+    pending_ip: Optional[str] = None
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        if not line[0].isspace() and line.rstrip().endswith(":"):
+            adapter = line.rstrip()[:-1].strip()
+            pending_ip = None
+            continue
+        m = _IPV4_RE.search(line)
+        if not m:
+            continue
+        addr = m.group(1)
+        if pending_ip is None and "IPv4" in line:
+            pending_ip = addr
+        elif pending_ip is not None and addr.startswith("255."):
+            try:
+                prefix = ipaddress.IPv4Network(f"0.0.0.0/{addr}").prefixlen
+            except ValueError:
+                prefix = 24
+            if not pending_ip.startswith(("127.", "169.254.")):
+                interfaces.append((adapter, pending_ip, prefix))
+            pending_ip = None
+    return interfaces
+
+
+def _get_network_interfaces() -> List[Tuple[str, str, int]]:
+    """Restituisce l'elenco delle schede di rete attive sul sistema (Nome, IP, prefisso)."""
+    interfaces: List[Tuple[str, str, int]] = []
     try:
-        cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        r = subprocess.run(
-            ["ipconfig"],
-            capture_output=True,
-            text=True,
-            encoding="cp850",
-            errors="replace",
-            creationflags=cr,
-            timeout=5,
-        )
-        current_adapter = "Scheda di rete"
-        for line in (r.stdout or "").splitlines():
-            line_str = line.strip()
-            if line.startswith("Scheda ") or "adapter" in line.lower():
-                current_adapter = line.split(":")[0].strip()
-            elif "IPv4" in line_str or "Indirizzo IPv4" in line_str:
-                m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line_str)
-                if m:
-                    ip = m.group(1)
-                    if not ip.startswith("127.") and not ip.startswith("169.254."):
-                        interfaces.append((current_adapter, ip))
+        interfaces = _parse_ipconfig(_run_console(["ipconfig"], timeout=5))
     except Exception:
         pass
 
     if not interfaces:
         local_ip = _local_ipv4()
         if local_ip:
-            interfaces.append(("Scheda Predefinita", local_ip))
+            interfaces.append(("Scheda Predefinita", local_ip, 24))
     return interfaces
 
 
-def _default_range_for_ip(ip: str) -> Tuple[str, str]:
-    if not ip or len(ip.split(".")) != 4:
+def _default_range_for_ip(ip: str, prefix: int = 24) -> Tuple[str, str]:
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except ValueError:
         return "192.168.1.1", "192.168.1.254"
-    b = ".".join(ip.split(".")[:3])
-    return f"{b}.1", f"{b}.254"
+    net = ipaddress.IPv4Network(f"{addr}/{prefix}", strict=False)
+    # Reti troppo grandi (es. /16): si propone la /24 dell'host, entro il limite di scansione
+    if net.num_addresses - 2 > MAX_SCAN_HOSTS or prefix > 30:
+        net = ipaddress.IPv4Network(f"{addr}/24", strict=False)
+    return str(net.network_address + 1), str(net.broadcast_address - 1)
 
 
 def _default_range() -> Tuple[str, str]:
-    return _default_range_for_ip(_local_ipv4() or "")
+    local_ip = _local_ipv4() or ""
+    for _name, ip, prefix in _get_network_interfaces():
+        if ip == local_ip:
+            return _default_range_for_ip(ip, prefix)
+    return _default_range_for_ip(local_ip)
 
 
 def _parse_ip_input(start_ip: str, end_ip: str) -> List[str]:
@@ -266,11 +314,16 @@ def _parse_ip_input(start_ip: str, end_ip: str) -> List[str]:
 
     if "/" in s:
         net = ipaddress.IPv4Network(s, strict=False)
+        # Controllo prima di generare la lista: una /8 sarebbero 16 milioni di stringhe
+        if net.num_addresses - 2 > MAX_SCAN_HOSTS:
+            raise ValueError(f"la rete {net} contiene troppi indirizzi (massimo {MAX_SCAN_HOSTS})")
         return [str(h) for h in net.hosts()]
 
     a, b = ipaddress.IPv4Address(s), ipaddress.IPv4Address(e)
     if int(a) > int(b):
         a, b = b, a
+    if int(b) - int(a) + 1 > MAX_SCAN_HOSTS:
+        raise ValueError(f"l'intervallo contiene troppi indirizzi (massimo {MAX_SCAN_HOSTS})")
     return [str(ipaddress.IPv4Address(i)) for i in range(int(a), int(b) + 1)]
 
 
@@ -303,68 +356,97 @@ def _ping_subprocess(ip: str, timeout_ms: int) -> Tuple[bool, float]:
         return False, 0.0
 
 
+_INVALID_HANDLE = ctypes.c_void_p(-1).value
+_ICMP_LOCK = threading.Lock()
+_icmp_api: Optional[Any] = None
+_icmp_api_ready = False
+
+
+def _get_icmp_api() -> Optional[Any]:
+    """Carica iphlpapi con i prototipi corretti: senza restype HANDLE verrebbe troncato a 32 bit."""
+    global _icmp_api, _icmp_api_ready
+    with _ICMP_LOCK:
+        if _icmp_api_ready:
+            return _icmp_api
+        _icmp_api_ready = True
+        if sys.platform == "win32":
+            try:
+                api = ctypes.WinDLL("iphlpapi.dll")
+                api.IcmpCreateFile.restype = ctypes.wintypes.HANDLE
+                api.IcmpCreateFile.argtypes = []
+                api.IcmpCloseHandle.restype = ctypes.wintypes.BOOL
+                api.IcmpCloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+                api.IcmpSendEcho.restype = ctypes.wintypes.DWORD
+                api.IcmpSendEcho.argtypes = [
+                    ctypes.wintypes.HANDLE,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                    ctypes.wintypes.WORD,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.wintypes.DWORD,
+                    ctypes.wintypes.DWORD,
+                ]
+                _icmp_api = api
+            except (OSError, AttributeError):
+                _icmp_api = None
+    return _icmp_api
+
+
 def _ping_one(ip: str, timeout_ms: int = 750) -> Tuple[bool, float]:
     """Effettua un ping ICMP nativo ad alta velocità via Windows IcmpSendEcho API (ctypes).
     Passa automaticamente al fallback subprocess ping.exe se l'API non è disponibile.
     """
-    if sys.platform == "win32":
-        try:
-            iphlpapi = ctypes.windll.iphlpapi
-            icmp = iphlpapi.IcmpCreateFile()
-            if icmp and icmp != -1 and icmp != 0xFFFFFFFF:
-                send_data = b"LanScannerPing"
-                reply_size = 32 + len(send_data) + 32
-                reply_buffer = ctypes.create_string_buffer(reply_size)
+    api = _get_icmp_api()
+    if api is None:
+        return _ping_subprocess(ip, timeout_ms)
 
-                dest_ip = ctypes.c_ulong(socket.ntohl(struct.unpack("!I", socket.inet_aton(ip))[0]))
+    try:
+        # IPAddr è in ordine di rete: i 4 byte di inet_aton letti come intero nativo
+        dest_ip = struct.unpack("=I", socket.inet_aton(ip))[0]
+    except OSError:
+        return False, 0.0
 
-                res = iphlpapi.IcmpSendEcho(
-                    icmp,
-                    dest_ip,
-                    send_data,
-                    len(send_data),
-                    None,
-                    reply_buffer,
-                    reply_size,
-                    timeout_ms,
-                )
-                iphlpapi.IcmpCloseHandle(icmp)
-
-                if res > 0:
-                    status = struct.unpack_from("<I", reply_buffer.raw, 4)[0]
-                    rtt_ms = struct.unpack_from("<I", reply_buffer.raw, 8)[0]
-                    if status == 0:  # IP_SUCCESS
-                        return True, float(rtt_ms)
-        except Exception:
-            pass
-
-    return _ping_subprocess(ip, timeout_ms)
+    icmp = api.IcmpCreateFile()
+    if not icmp or icmp == _INVALID_HANDLE:
+        return _ping_subprocess(ip, timeout_ms)
+    try:
+        send_data = ctypes.create_string_buffer(b"LanScannerPing", 14)
+        # ICMP_ECHO_REPLY (40 byte su x64) + dati + 8 byte per un eventuale errore ICMP
+        reply_size = ctypes.sizeof(ctypes.c_void_p) * 2 + 24 + len(send_data) + 8
+        reply_buffer = ctypes.create_string_buffer(reply_size)
+        res = api.IcmpSendEcho(icmp, dest_ip, send_data, len(send_data), None, reply_buffer, reply_size, timeout_ms)
+        if res > 0:
+            status, rtt_ms = struct.unpack_from("<II", reply_buffer.raw, 4)
+            if status == 0:  # IP_SUCCESS
+                return True, float(rtt_ms)
+        return False, 0.0
+    except Exception:
+        return _ping_subprocess(ip, timeout_ms)
+    finally:
+        api.IcmpCloseHandle(icmp)
 
 
 _ARP_REGEX = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})")
 
 
+def _parse_arp(output: str) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    for line in output.splitlines():
+        for x in _ARP_REGEX.finditer(line):
+            ip_s, md = x.group(1), x.group(2).upper().replace("-", ":")
+            # Broadcast e multicast (01:00:5E…, 33:33…) non sono dispositivi
+            if md == "FF:FF:FF:FF:FF:FF" or int(md[:2], 16) & 1:
+                continue
+            m[ip_s] = md
+    return m
+
+
 def _arp_map() -> Dict[str, str]:
     try:
-        cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        r = subprocess.run(
-            ["arp", "-a"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=cr,
-            timeout=30,
-        )
+        return _parse_arp(_run_console(["arp", "-a"], timeout=30))
     except (OSError, subprocess.TimeoutExpired):
         return {}
-
-    m: Dict[str, str] = {}
-    for line in (r.stdout or "").splitlines():
-        for x in _ARP_REGEX.finditer(line):
-            ip_s, md = x.group(1), x.group(2).upper()
-            m[ip_s] = md.replace("-", ":")
-    return m
 
 
 def _send_wol(mac: str) -> bool:
@@ -391,102 +473,174 @@ def _resolve_hostname(ip: str) -> str:
         return ""
 
 
+def _dns_read_name(data: bytes, offset: int) -> Tuple[str, int]:
+    """Legge un nome DNS (con puntatori di compressione) e restituisce (nome, offset dopo il nome)."""
+    labels: List[str] = []
+    end_offset: Optional[int] = None
+    jumps = 0
+    while True:
+        if offset >= len(data):
+            raise ValueError("nome DNS troncato")
+        length = data[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(data) or jumps > 16:
+                raise ValueError("puntatore DNS non valido")
+            if end_offset is None:
+                end_offset = offset + 2
+            offset = ((length & 0x3F) << 8) | data[offset + 1]
+            jumps += 1
+            continue
+        if length == 0:
+            offset += 1
+            break
+        offset += 1
+        labels.append(data[offset:offset + length].decode("utf-8", errors="replace"))
+        offset += length
+    return ".".join(labels), end_offset if end_offset is not None else offset
+
+
+def _build_ptr_query(ip: str, query_id: int = 0) -> bytes:
+    rev_ip = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+    query = struct.pack("!HHHHHH", query_id, 0, 1, 0, 0, 0)
+    for label in rev_ip.split("."):
+        query += bytes([len(label)]) + label.encode("ascii")
+    return query + b"\x00" + struct.pack("!HH", 12, 1)  # fine nome, tipo PTR, classe IN
+
+
+def _parse_ptr_response(data: bytes) -> str:
+    """Restituisce il primo record PTR della sezione risposte, saltando la domanda ripetuta."""
+    if len(data) < 12:
+        return ""
+    _qid, _flags, qdcount, ancount, _ns, _ar = struct.unpack_from("!HHHHHH", data, 0)
+    offset = 12
+    for _ in range(qdcount):
+        _, offset = _dns_read_name(data, offset)
+        offset += 4
+    for _ in range(ancount):
+        _, offset = _dns_read_name(data, offset)
+        if offset + 10 > len(data):
+            break
+        rtype, _rclass, _ttl, rdlength = struct.unpack_from("!HHIH", data, offset)
+        offset += 10
+        if rtype == 12:
+            name, _ = _dns_read_name(data, offset)
+            return name.rstrip(".")
+        offset += rdlength
+    return ""
+
+
 def _resolve_mdns_name(ip: str, timeout: float = 0.4) -> str:
-    """Sonda le risposte mDNS su UDP 5353 (.local domain)."""
+    """Chiede il nome .local al dispositivo con una query mDNS unicast (UDP 5353, RFC 6762 §6.7)."""
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        parts = ip.split(".")
-        if len(parts) != 4:
-            return ""
-        rev_ip = ".".join(reversed(parts)) + ".in-addr.arpa"
-        query = b"\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-        for label in rev_ip.split("."):
-            query += bytes([len(label)]) + label.encode("ascii")
-        query += b"\x00\x00\x0c\x00\x01"
+        ipaddress.IPv4Address(ip)
+    except ValueError:
+        return ""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(_build_ptr_query(ip, query_id=0x4C53), (ip, 5353))
+            data, _ = sock.recvfrom(4096)
+        return _parse_ptr_response(data)
+    except (OSError, ValueError, struct.error):
+        return ""
 
-        sock.sendto(query, (ip, 5353))
-        data, _ = sock.recvfrom(1024)
-        sock.close()
 
-        if len(data) > 12:
-            # Parse basic string labels from mDNS answer
-            labels = re.findall(rb"[\x01-\x30]([a-zA-Z0-9\-_]{2,30})", data)
-            valid = [l.decode("ascii", errors="ignore") for l in labels if l.lower() not in (b"in-addr", b"arpa", b"local")]
-            if valid:
-                return f"{valid[0]}.local"
-    except Exception:
-        pass
+def _parse_ssdp_response(text: str) -> str:
+    headers: Dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            headers.setdefault(key.strip().lower(), value.strip())
+    if headers.get("server"):
+        return headers["server"]
+    if headers.get("location"):
+        return f"UPnP ({headers['location']})"
     return ""
 
 
 def _probe_ssdp_info(ip: str, timeout: float = 0.5) -> str:
     """Sonda l'header SSDP UPnP (UDP 1900)."""
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        req = (
-            "M-SEARCH * HTTP/1.1\r\n"
-            f"HOST: {ip}:1900\r\n"
-            'MAN: "ssdp:discover"\r\n'
-            "MX: 1\r\n"
-            "ST: ssdp:all\r\n\r\n"
-        ).encode("utf-8")
-        sock.sendto(req, (ip, 1900))
-        data, _ = sock.recvfrom(2048)
-        sock.close()
-        text = data.decode("utf-8", errors="ignore")
-        for line in text.splitlines():
-            if line.lower().startswith("server:"):
-                return line.split(":", 1)[1].strip()
-            elif line.lower().startswith("location:"):
-                return f"UPnP ({line.split(':', 1)[1].strip()})"
-    except Exception:
-        pass
-    return ""
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            req = (
+                "M-SEARCH * HTTP/1.1\r\n"
+                f"HOST: {ip}:1900\r\n"
+                'MAN: "ssdp:discover"\r\n'
+                "MX: 1\r\n"
+                "ST: ssdp:all\r\n\r\n"
+            ).encode("utf-8")
+            sock.sendto(req, (ip, 1900))
+            data, _ = sock.recvfrom(2048)
+        return _parse_ssdp_response(data.decode("utf-8", errors="ignore"))
+    except OSError:
+        return ""
 
 
 def _nbtstat(ip: str) -> str:
     try:
-        cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        r = subprocess.run(
-            ["nbtstat", "-A", ip],
-            capture_output=True,
-            text=True,
-            encoding="cp850",
-            errors="replace",
-            creationflags=cr,
-            timeout=20,
-        )
-        return (r.stdout or "") + (r.stderr or "")
+        return _run_console(["nbtstat", "-A", ip], timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         return "(nbtstat non disponibile o timeout)"
 
 
-def _probe_ports_with_banner(ip: str, ports: List[Tuple[int, str]], timeout: float = 0.35) -> List[Tuple[int, str, str]]:
-    """Sonda una lista di porte TCP con estrazione del banner di risposta."""
-    results = []
-    for port, label in ports:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def _parse_ports(txt: str, max_ports: int = 1024) -> List[Tuple[int, str]]:
+    """Interpreta '22, 80, 8000-8010'. Ignora porte fuori da 1-65535 e duplicati."""
+    seen: Dict[int, str] = {}
+    for part in txt.split(","):
+        part = part.strip()
+        if "-" in part:
+            try:
+                s_p, e_p = sorted(map(int, part.split("-", 1)))
+            except ValueError:
+                continue
+            for p in range(max(1, s_p), min(e_p, 65535) + 1):
+                seen.setdefault(p, f"Porta {p}")
+        elif part.isdigit() and 1 <= int(part) <= 65535:
+            seen.setdefault(int(part), f"Porta {int(part)}")
+    return list(seen.items())[:max_ports]
+
+
+def _probe_port(ip: str, port: int, timeout: float) -> Optional[str]:
+    """None se chiusa, altrimenti la prima riga del banner ('' se il servizio non ne invia)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         try:
-            if s.connect_ex((ip, port)) == 0:
-                banner = ""
-                try:
-                    if port in (80, 8080, 5000):
-                        s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
-                    data = s.recv(256)
-                    first = data.decode("utf-8", errors="replace").splitlines()
-                    if first:
-                        banner = first[0].strip()[:50]
-                except Exception:
-                    pass
-                results.append((port, label, banner))
+            if s.connect_ex((ip, port)) != 0:
+                return None
         except OSError:
-            pass
-        finally:
-            s.close()
-    return results
+            return None
+        try:
+            if port in (80, 8080, 5000, 8000, 8008, 8888):
+                s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+            data = s.recv(256)
+            first = data.decode("utf-8", errors="replace").splitlines()
+            return first[0].strip()[:80] if first else ""
+        except OSError:
+            return ""
+
+
+def _probe_ports_with_banner(
+    ip: str,
+    ports: List[Tuple[int, str]],
+    timeout: float = 0.5,
+    cancel: Optional[threading.Event] = None,
+) -> List[Tuple[int, str, str]]:
+    """Sonda in parallelo una lista di porte TCP con estrazione del banner di risposta."""
+    results: List[Tuple[int, str, str]] = []
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(64, max(1, len(ports))))
+    try:
+        futs = {ex.submit(_probe_port, ip, port, timeout): (port, label) for port, label in ports}
+        for fu in concurrent.futures.as_completed(futs):
+            if cancel is not None and cancel.is_set():
+                break
+            banner = fu.result()
+            if banner is not None:
+                port, label = futs[fu]
+                results.append((port, label, banner))
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return sorted(results)
 
 
 # --- BACKGROUND THREADS ---
@@ -541,6 +695,40 @@ class UpdateCheckerThread(QThread):
         return parse_version(latest_str) > parse_version(current_str)
 
 
+_ALIVE_THREADS: "set[QThread]" = set()
+
+
+def _keep_alive(thread: QThread) -> None:
+    """Riferimento forte finché il thread lavora, anche se la finestra che l'ha lanciato è già chiusa.
+
+    Va usato con thread senza parent: un QThread distrutto mentre gira fa terminare l'app.
+    """
+    _ALIVE_THREADS.add(thread)
+    thread.finished.connect(lambda: _ALIVE_THREADS.discard(thread))
+
+
+class TaskThread(QThread):
+    """Esegue fn() fuori dal thread della GUI e consegna il risultato con un segnale.
+
+    Gli aggiornamenti della GUI da un threading.Thread con QTimer.singleShot non partono
+    mai (quel thread non ha un event loop Qt): i segnali Qt invece arrivano in coda al thread principale.
+    """
+
+    result_ready = Signal(object)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+        _keep_alive(self)
+
+    def run(self) -> None:
+        try:
+            res = self._fn()
+        except Exception as e:  # il chiamante mostra l'errore come testo
+            res = e
+        self.result_ready.emit(res)
+
+
 class ContinuousPingWorker(QThread):
     ping_result = Signal(bool, float, str)
 
@@ -548,69 +736,87 @@ class ContinuousPingWorker(QThread):
         super().__init__(parent)
         self.ip = ip
         self.interval_sec = interval_sec
-        self._running = True
+        self._stop_event = threading.Event()
 
     def stop(self) -> None:
-        self._running = False
+        self._stop_event.set()
 
     def run(self) -> None:
-        while self._running:
+        while not self._stop_event.is_set():
             ok, rtt = _ping_one(self.ip, timeout_ms=800)
+            if self._stop_event.is_set():
+                break
             now_str = time.strftime("%H:%M:%S")
             self.ping_result.emit(ok, rtt, now_str)
-            time.sleep(self.interval_sec)
+            self._stop_event.wait(self.interval_sec)
+
+
+_TRACERT_HOP_RE = re.compile(r"^\s*(\d+)\s+((?:(?:<?\d+\s*ms|\*)\s+){1,3})(\d{1,3}(?:\.\d{1,3}){3})")
+
+
+def _parse_tracert_line(line: str) -> Optional[Tuple[int, str, float]]:
+    """Riconosce una riga di tracert -d: (hop, ip, media RTT in ms) oppure None."""
+    m = _TRACERT_HOP_RE.search(line)
+    if not m:
+        return None
+    rtts = [float(x) for x in re.findall(r"<?(\d+)\s*ms", m.group(2))]
+    avg_rtt = round(sum(rtts) / len(rtts), 1) if rtts else 0.0
+    return int(m.group(1)), m.group(3), avg_rtt
 
 
 class TracerouteWorker(QThread):
     hop_found = Signal(int, str, float, str)
-    finished = Signal()
+    trace_finished = Signal()
 
     def __init__(self, target_ip: str, max_hops: int = 30, parent=None):
         super().__init__(parent)
         self.target_ip = target_ip
         self.max_hops = max_hops
         self._running = True
+        self._proc: Optional[subprocess.Popen] = None
 
     def stop(self) -> None:
         self._running = False
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
 
     def run(self) -> None:
         try:
             cr = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            p = subprocess.Popen(
+            self._proc = subprocess.Popen(
                 ["tracert", "-d", "-h", str(self.max_hops), "-w", "750", self.target_ip],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                encoding="cp850",
+                encoding=_console_encoding(),
                 errors="replace",
                 creationflags=cr,
             )
-            for line in iter(p.stdout.readline, ""):
+            for line in iter(self._proc.stdout.readline, ""):
                 if not self._running:
-                    p.terminate()
                     break
-                line_str = line.strip()
-                m = re.search(r"^\s*(\d+)\s+([\d\s<ms\*]+)\s+(\d{1,3}(?:\.\d{1,3}){3})", line_str)
-                if m:
-                    hop = int(m.group(1))
-                    rtt_raw = m.group(2)
-                    ip = m.group(3)
-                    rtts = re.findall(r"(\d+)\s*ms", rtt_raw)
-                    avg_rtt = float(rtts[0]) if rtts else 0.0
-                    hn = _resolve_hostname(ip)
-                    self.hop_found.emit(hop, ip, avg_rtt, hn)
+                hop = _parse_tracert_line(line)
+                if hop:
+                    hop_n, ip, avg_rtt = hop
+                    self.hop_found.emit(hop_n, ip, avg_rtt, _resolve_hostname(ip))
                     if ip == self.target_ip:
                         break
         except Exception:
             pass
-        self.finished.emit()
+        finally:
+            self.stop()
+        self.trace_finished.emit()
 
 
 class ScanWorkerThread(QThread):
     progress_updated = Signal(int, int)
     initial_alive_found = Signal(list)
     hostname_resolved = Signal(str, str, str, str)  # ip, hostname, hint, note
+    names_progress = Signal(int, int)
     scan_finished = Signal(int)
     scan_interrupted = Signal()
     scan_error = Signal(str)
@@ -618,17 +824,40 @@ class ScanWorkerThread(QThread):
     def __init__(self, hosts: List[str], device_notes: Dict[str, str], max_workers: int = 64, parent=None):
         super().__init__(parent)
         self.hosts = hosts
-        self.device_notes = device_notes
+        self.device_notes = dict(device_notes)
         self.max_workers = max_workers
         self._cancel_event = threading.Event()
 
     def stop(self) -> None:
         self._cancel_event.set()
 
+    def _parallel(self, fn, items: List[str], workers: int):
+        """Esegue fn(item) in parallelo e restituisce (item, risultato) man mano; si ferma subito su stop()."""
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        try:
+            futs = {ex.submit(fn, it): it for it in items}
+            for fu in concurrent.futures.as_completed(futs):
+                if self._cancel_event.is_set():
+                    return
+                try:
+                    res = fu.result()
+                except Exception:
+                    res = None
+                yield futs[fu], res
+        finally:
+            # Senza cancel_futures l'uscita aspetterebbe tutti i ping ancora in coda (fino a ~50 s)
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _identify(ip: str) -> Tuple[str, str, str]:
+        hn = _resolve_hostname(ip) or ""
+        mdns_name = _resolve_mdns_name(ip) if not hn else ""
+        ssdp_info = _probe_ssdp_info(ip) if not hn and not mdns_name else ""
+        return hn, mdns_name, ssdp_info
+
     def run(self) -> None:
         timeout_ms = 750
         ping_results: Dict[str, Tuple[bool, float]] = {}
-        done = 0
         total = len(self.hosts)
 
         try:
@@ -636,70 +865,57 @@ class ScanWorkerThread(QThread):
             initial_arp = _arp_map()
 
             # Scansione ICMP Ping nativa parallela
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-                futs = {ex.submit(_ping_one, ip, timeout_ms): ip for ip in self.hosts}
-                for fu in concurrent.futures.as_completed(futs):
-                    if self._cancel_event.is_set():
-                        break
-                    ip = futs[fu]
-                    try:
-                        ok, rtt = fu.result()
-                    except Exception:
-                        ok, rtt = False, 0.0
-                    ping_results[ip] = (ok, rtt)
-                    done += 1
-                    if done % 8 == 0 or done == total:
-                        self.progress_updated.emit(done, total)
+            for done, (ip, res) in enumerate(
+                self._parallel(lambda h: _ping_one(h, timeout_ms), self.hosts, self.max_workers), 1
+            ):
+                ping_results[ip] = res or (False, 0.0)
+                if done % 8 == 0 or done == total:
+                    self.progress_updated.emit(done, total)
 
             if self._cancel_event.is_set():
                 self.scan_interrupted.emit()
                 return
 
             time.sleep(0.2)
-            post_arp = _arp_map()
-            combined_arp = {**initial_arp, **post_arp}
+            combined_arp = {**initial_arp, **_arp_map()}
 
-            # Controlla conflitti MAC (stesso MAC per piu IP o viceversa)
+            # Stesso MAC su più IP dell'intervallo: possibile conflitto o proxy ARP
+            hosts_set = set(self.hosts)
             mac_counts: Dict[str, int] = {}
-            for m in combined_arp.values():
-                if m and m != "—":
+            for ip_s, m in combined_arp.items():
+                if ip_s in hosts_set:
                     mac_counts[m] = mac_counts.get(m, 0) + 1
 
             rows: List[Tuple[str, str, str, str, str, str, str]] = []
-
             for ip in self.hosts:
                 ok, rtt = ping_results.get(ip, (False, 0.0))
                 mac = combined_arp.get(ip, "")
                 note = self.device_notes.get(mac, self.device_notes.get(ip, ""))
+                v = _vendor_from_mac(mac) if mac else ""
 
                 if ok:
-                    status_str = f"🟢 Attivo ({int(rtt)} ms)" if rtt > 0 else "🟢 Attivo"
-                    v = _vendor_from_mac(mac) if mac else ""
-                    rows.append((ip, status_str, mac or "—", v or "—", "...", "—", note or "—"))
-                elif mac and mac != "—":
-                    status_str = "🟡 Risponde ARP (Firewall)"
-                    v = _vendor_from_mac(mac)
-                    rows.append((ip, status_str, mac, v or "—", "...", "—", note or "—"))
+                    status_str = f"🟢 Attivo ({int(rtt)} ms)" if rtt > 0 else "🟢 Attivo (<1 ms)"
+                elif mac:
+                    # Nella cache ARP ma senza risposta al ping: firewall oppure voce recente di un dispositivo spento
+                    status_str = "🟡 Solo ARP (no ping)"
+                else:
+                    continue
+                rows.append((ip, status_str, mac or "—", v or "—", "...", "—", note or "—"))
 
             sorted_rows = sorted(rows, key=lambda x: int(ipaddress.IPv4Address(x[0])))
             self.initial_alive_found.emit(sorted_rows)
 
-            # Risoluzione Hostname, mDNS, SSDP ed Hint
+            # Risoluzione Hostname, mDNS, SSDP ed Hint in parallelo: un host senza nome DNS costa ~6 s
             sorted_ips = [r[0] for r in sorted_rows]
-            for ip in sorted_ips:
-                if self._cancel_event.is_set():
-                    break
+            for done, (ip, res) in enumerate(self._parallel(self._identify, sorted_ips, 32), 1):
+                hn, mdns_name, ssdp_info = res or ("", "", "")
                 mac = combined_arp.get(ip, "")
                 v = _vendor_from_mac(mac) if mac else ""
-                hn = _resolve_hostname(ip) or ""
-                mdns_name = _resolve_mdns_name(ip) if not hn else ""
-                ssdp_info = _probe_ssdp_info(ip) if not hn and not mdns_name else ""
-
                 disp_hn = hn or mdns_name or "—"
-                hint = _quick_hint(disp_hn, v, mac, mdns_name, ssdp_info)
-                note = self.device_notes.get(mac, self.device_notes.get(ip, "—"))
-
+                hint = _quick_hint(disp_hn, v, mac, mdns_name, ssdp_info, mac_counts.get(mac, 0))
+                note = self.device_notes.get(mac, self.device_notes.get(ip, "")) or "—"
                 self.hostname_resolved.emit(ip, disp_hn, hint, note)
+                self.names_progress.emit(done, len(sorted_ips))
 
             if self._cancel_event.is_set():
                 self.scan_interrupted.emit()
@@ -712,6 +928,14 @@ class ScanWorkerThread(QThread):
 
 
 # --- DIALOGS & TOOLS ---
+
+def _exec_dialog(dlg: QDialog) -> int:
+    """Apre la finestra modale e la distrugge alla chiusura (con parent resterebbe in memoria fino all'uscita)."""
+    try:
+        return dlg.exec()
+    finally:
+        dlg.deleteLater()
+
 
 class SubnetCalculatorDialog(QDialog):
     """Calcolatore Subnet / Notazione CIDR e suddivisione IP."""
@@ -850,43 +1074,48 @@ class CustomPortScanDialog(QDialog):
         btn_box.addWidget(btn_close)
         layout.addLayout(btn_box)
 
+        self._cancel = threading.Event()
+        self._task: Optional[TaskThread] = None
+        self.btn_scan = btn_scan
+        self.txt_ports.returnPressed.connect(self._run_scan)
         self._run_scan()
 
+    MAX_PORTS = 1024
+
     def _run_scan(self) -> None:
-        self.txt_results.setText("Scansione porte e lettura banner in corso...")
-        raw_ports = self.txt_ports.text()
+        if self._task is not None and self._task.isRunning():
+            return
+        ports_to_scan = _parse_ports(self.txt_ports.text(), self.MAX_PORTS) or self.PORTS_DEFAULT
+        labels = dict(self.PORTS_DEFAULT)
+        ports_to_scan = [(p, labels.get(p, lbl)) for p, lbl in ports_to_scan]
+        self.txt_results.setText(f"Scansione di {len(ports_to_scan)} porte e lettura banner in corso...")
+        self.btn_scan.setEnabled(False)
 
-        def parse_ports(txt: str) -> List[Tuple[int, str]]:
-            p_list: List[Tuple[int, str]] = []
-            for part in txt.split(","):
-                part = part.strip()
-                if "-" in part:
-                    try:
-                        s_p, e_p = map(int, part.split("-"))
-                        for p in range(s_p, min(e_p + 1, 65535)):
-                            p_list.append((p, f"Porta {p}"))
-                    except ValueError:
-                        pass
-                elif part.isdigit():
-                    p = int(part)
-                    p_list.append((p, f"Porta {p}"))
-            return p_list or self.PORTS_DEFAULT
+        ip, cancel = self.target_ip, self._cancel
 
-        ports_to_scan = parse_ports(raw_ports)
-
-        def job() -> None:
-            open_found = _probe_ports_with_banner(self.target_ip, ports_to_scan)
-            lines = [f"=== SCANSIONE PORTE TCP SU {self.target_ip} ===\n\n"]
+        def job() -> str:
+            open_found = _probe_ports_with_banner(ip, ports_to_scan, cancel=cancel)
+            lines = [f"=== SCANSIONE PORTE TCP SU {ip} ({len(ports_to_scan)} porte) ===\n\n"]
             if open_found:
                 for port, label, banner in open_found:
                     b_str = f" → Banner: [{banner}]" if banner else ""
                     lines.append(f"🟢 Porta {port:<5} OPEN ({label}){b_str}\n")
             else:
-                lines.append("❌ Nessuna porta aperta trovata tra quelle modificate.\n")
-            report = "".join(lines)
-            QTimer.singleShot(0, lambda: self.txt_results.setText(report))
+                lines.append("❌ Nessuna porta aperta tra quelle testate.\n")
+            return "".join(lines)
 
-        threading.Thread(target=job, daemon=True).start()
+        self._task = TaskThread(job)
+        self._task.result_ready.connect(self._on_scan_done)
+        self._task.start()
+
+    @Slot(object)
+    def _on_scan_done(self, report: object) -> None:
+        self.txt_results.setText(str(report) if not isinstance(report, Exception) else f"Errore: {report}")
+        self.btn_scan.setEnabled(True)
+
+    def done(self, result: int) -> None:
+        self._cancel.set()
+        super().done(result)
 
 
 class TracerouteDialog(QDialog):
@@ -929,10 +1158,16 @@ class TracerouteDialog(QDialog):
         btn_box.addWidget(btn_close)
         layout.addLayout(btn_box)
 
-        self.worker = TracerouteWorker(target_ip, parent=self)
+        self.worker = TracerouteWorker(target_ip)
+        _keep_alive(self.worker)
         self.worker.hop_found.connect(self._on_hop_found)
-        self.worker.finished.connect(self._on_finished)
+        self.worker.trace_finished.connect(self._on_finished)
         self.worker.start()
+
+    def done(self, result: int) -> None:
+        # Termina tracert; il thread finisce da solo anche se la finestra viene distrutta
+        self.worker.stop()
+        super().done(result)
 
     def _on_hop_found(self, hop: int, ip: str, rtt: float, hostname: str) -> None:
         rtt_str = f"{rtt:.1f} ms" if rtt > 0 else "<1 ms"
@@ -941,12 +1176,13 @@ class TracerouteDialog(QDialog):
 
     def _on_finished(self) -> None:
         self.btn_toggle.setEnabled(False)
-        self.btn_toggle.setText("Completato")
+        if self.btn_toggle.text() != "Interrotto":
+            self.btn_toggle.setText("Completato")
 
     def _stop_trace(self) -> None:
         if self.worker.isRunning():
-            self.worker.stop()
             self.btn_toggle.setText("Interrotto")
+            self.worker.stop()
 
 
 class ContinuousPingDialog(QDialog):
@@ -1010,9 +1246,7 @@ class ContinuousPingDialog(QDialog):
         btn_box.addWidget(btn_close)
         layout.addLayout(btn_box)
 
-        self.worker = ContinuousPingWorker(target_ip, interval_sec=1.0, parent=self)
-        self.worker.ping_result.connect(self._on_ping_result)
-        self.worker.start()
+        self._start_worker()
 
     def _on_ping_result(self, ok: bool, rtt: float, now_str: str) -> None:
         self.sent_count += 1
@@ -1032,24 +1266,36 @@ class ContinuousPingDialog(QDialog):
         self.card_loss.setText(f"Persi: <b>{loss_pct}%</b>")
         self.card_rtt.setText(f"Latenza Media: <b>{avg_rtt} ms</b>" if self.rtt_list else "Latenza: -")
 
+    def _start_worker(self) -> None:
+        self.worker = ContinuousPingWorker(self.target_ip, interval_sec=1.0)
+        _keep_alive(self.worker)
+        self.worker.ping_result.connect(self._on_ping_result)
+        self.worker.start()
+
+    def _stop_worker(self) -> None:
+        # Scollegato subito: l'ultimo ping in volo non deve arrivare dopo la pausa
+        self.worker.stop()
+        try:
+            self.worker.ping_result.disconnect(self._on_ping_result)
+        except (RuntimeError, TypeError):
+            pass
+
     def _toggle_ping(self) -> None:
-        if self.worker.isRunning():
-            self.worker.stop()
+        if not self.worker._stop_event.is_set():
+            self._stop_worker()
             self.btn_toggle.setText("▶️ Riprendi")
         else:
-            self.worker = ContinuousPingWorker(self.target_ip, interval_sec=1.0, parent=self)
-            self.worker.ping_result.connect(self._on_ping_result)
-            self.worker.start()
+            self._start_worker()
             self.btn_toggle.setText("⏸️ Pausa")
 
     def _copy_log(self) -> None:
         QApplication.clipboard().setText(self.txt_log.toPlainText())
         QMessageBox.information(self, "Copia", "Log dei ping copiato negli appunti.")
 
-    def closeEvent(self, event) -> None:
-        if self.worker.isRunning():
-            self.worker.stop()
-        super().closeEvent(event)
+    def done(self, result: int) -> None:
+        # "Chiudi" (accept), Esc e la X passano tutti da qui; closeEvent copriva solo la X
+        self._stop_worker()
+        super().done(result)
 
 
 class DeviceDetailDialog(QDialog):
@@ -1074,6 +1320,9 @@ class DeviceDetailDialog(QDialog):
         def add_info(lbl_text, val_text, row, col):
             l = QLabel(f"<b>{lbl_text}:</b>")
             v = QLabel(str(val_text or "—"))
+            # Hostname e banner arrivano dalla rete: niente interpretazione come rich text
+            v.setTextFormat(Qt.PlainText)
+            v.setTextInteractionFlags(Qt.TextSelectableByMouse)
             grid.addWidget(l, row, col * 2)
             grid.addWidget(v, row, col * 2 + 1)
 
@@ -1103,10 +1352,12 @@ class DeviceDetailDialog(QDialog):
         layout.addWidget(self.txt_report)
 
         btn_box = QHBoxLayout()
+        self._task: Optional[TaskThread] = None
         btn_analyze = QPushButton("🔍 Analizza Dettagliatamente")
         btn_analyze.setObjectName("PrimaryBtn")
         btn_analyze.setCursor(Qt.PointingHandCursor)
         btn_analyze.clicked.connect(self._start_analysis)
+        self.btn_analyze = btn_analyze
 
         btn_copy = QPushButton("📋 Copia Report")
         btn_copy.setObjectName("SecondaryBtn")
@@ -1127,23 +1378,30 @@ class DeviceDetailDialog(QDialog):
         self.txt_report.setText("Clicca su 'Analizza Dettagliatamente' per eseguire il sondaggio avanzato dei protocolli di rete.")
 
     def _start_analysis(self) -> None:
+        if self._task is not None and self._task.isRunning():
+            return
         self.txt_report.setText("Analisi avanzata in corso (mDNS + UPnP + NetBIOS + Porte)...\nAttendere qualche secondo...")
+        self.btn_analyze.setEnabled(False)
+        ip, ports = self._ip, self.PORTS
 
-        def job() -> None:
-            lines = [f"=== REPORT DETTAGLIATO DISPOSITIVO {self._ip} ===\n\n"]
-            hn = _resolve_hostname(self._ip)
-            mdns = _resolve_mdns_name(self._ip)
-            ssdp = _probe_ssdp_info(self._ip)
-
-            lines.append(f"Hostname (DNS Reverse): {hn or '—'}\n")
-            lines.append(f"Hostname mDNS (.local):  {mdns or '—'}\n")
-            lines.append(f"UPnP / SSDP Server:     {ssdp or '—'}\n\n")
+        def job() -> str:
+            # Le sonde sono indipendenti: in parallelo il report arriva nel tempo della più lenta
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                f_hn = ex.submit(_resolve_hostname, ip)
+                f_mdns = ex.submit(_resolve_mdns_name, ip)
+                f_ssdp = ex.submit(_probe_ssdp_info, ip)
+                f_nbt = ex.submit(_nbtstat, ip)
+                f_ports = ex.submit(_probe_ports_with_banner, ip, ports)
+            lines = [f"=== REPORT DETTAGLIATO DISPOSITIVO {ip} ===\n\n"]
+            lines.append(f"Hostname (DNS Reverse): {f_hn.result() or '—'}\n")
+            lines.append(f"Hostname mDNS (.local):  {f_mdns.result() or '—'}\n")
+            lines.append(f"UPnP / SSDP Server:     {f_ssdp.result() or '—'}\n\n")
 
             lines.append("=== NetBIOS Name Service (nbtstat -A) ===\n")
-            lines.append(_nbtstat(self._ip) + "\n\n")
+            lines.append(f_nbt.result().strip() + "\n\n")
 
             lines.append("=== Sondaggio Porte TCP Comuni con Banner ===\n")
-            openp = _probe_ports_with_banner(self._ip, self.PORTS)
+            openp = f_ports.result()
             if openp:
                 for p, lbl, b in openp:
                     b_str = f" [{b}]" if b else ""
@@ -1153,10 +1411,16 @@ class DeviceDetailDialog(QDialog):
 
             lines.append("\n=== Note ===\n")
             lines.append("Produttore hardware derivato dal database IEEE OUI. Eventuali firewall locali o di rete possono filtrare i pacchetti.\n")
-            report = "".join(lines)
-            QTimer.singleShot(0, lambda: self.txt_report.setText(report))
+            return "".join(lines)
 
-        threading.Thread(target=job, daemon=True).start()
+        self._task = TaskThread(job)
+        self._task.result_ready.connect(self._on_analysis_done)
+        self._task.start()
+
+    @Slot(object)
+    def _on_analysis_done(self, report: object) -> None:
+        self.txt_report.setText(str(report) if not isinstance(report, Exception) else f"Errore durante l'analisi: {report}")
+        self.btn_analyze.setEnabled(True)
 
     def _copy_report(self) -> None:
         QApplication.clipboard().setText(self.txt_report.toPlainText())
@@ -1337,6 +1601,7 @@ class LanScannerWindow(QMainWindow):
         self.theme_mode = self.settings.value("theme_mode", "auto")
         self.scan_worker: Optional[ScanWorkerThread] = None
         self.update_checker: Optional[UpdateCheckerThread] = None
+        self._row_items: Dict[str, QTreeWidgetItem] = {}
 
         self._load_device_notes()
 
@@ -1536,11 +1801,11 @@ class LanScannerWindow(QMainWindow):
         menu_help.addSeparator()
 
         act_info = QAction("ℹ️ Informazioni e Crediti", self)
-        act_info.triggered.connect(lambda: AboutDialog(self).exec())
+        act_info.triggered.connect(lambda: _exec_dialog(AboutDialog(self)))
         menu_help.addAction(act_info)
 
         act_legal = QAction("⚖️ Avviso di Responsabilità Legale", self)
-        act_legal.triggered.connect(lambda: LegalDisclaimerDialog(self).exec())
+        act_legal.triggered.connect(lambda: _exec_dialog(LegalDisclaimerDialog(self)))
         menu_help.addAction(act_legal)
 
     def _update_recent_menu(self) -> None:
@@ -1771,19 +2036,25 @@ class LanScannerWindow(QMainWindow):
 
     def _populate_network_adapters(self) -> None:
         adapters = _get_network_interfaces()
+        local_ip = _local_ipv4()
         self.cmb_adapters.blockSignals(True)
         self.cmb_adapters.clear()
-        for name, ip in adapters:
-            self.cmb_adapters.addItem(f"{name} ({ip})", userData=ip)
+        for name, ip, prefix in adapters:
+            self.cmb_adapters.addItem(f"{name} ({ip}/{prefix})", userData=(ip, prefix))
+            self.cmb_adapters.setItemData(self.cmb_adapters.count() - 1, f"{name}\n{ip}/{prefix}", Qt.ToolTipRole)
+            if ip == local_ip:
+                # La scheda della rotta predefinita è quella dell'intervallo proposto all'avvio
+                self.cmb_adapters.setCurrentIndex(self.cmb_adapters.count() - 1)
         self.cmb_adapters.blockSignals(False)
 
     def _on_adapter_selected(self, index: int) -> None:
-        ip = self.cmb_adapters.itemData(index)
-        if ip:
-            s_a, s_b = _default_range_for_ip(ip)
+        data = self.cmb_adapters.itemData(index)
+        if data:
+            ip, prefix = data
+            s_a, s_b = _default_range_for_ip(ip, prefix)
             self.txt_ip_start.setText(s_a)
             self.txt_ip_end.setText(s_b)
-            self.lbl_status_msg.setText(f"Selezionata scheda: {ip} → Intervallo: {s_a} - {s_b}")
+            self.lbl_status_msg.setText(f"Selezionata scheda: {ip}/{prefix} → Intervallo: {s_a} - {s_b}")
 
     def _on_ip_start_changed(self, text: str) -> None:
         txt = text.strip()
@@ -1806,7 +2077,7 @@ class LanScannerWindow(QMainWindow):
 
     def _open_subnet_calc(self) -> None:
         cidr_str = self.txt_ip_start.text().strip()
-        SubnetCalculatorDialog(cidr_str, self).exec()
+        _exec_dialog(SubnetCalculatorDialog(cidr_str, self))
 
     def _on_scan_button_clicked(self) -> None:
         if self.scan_worker and self.scan_worker.isRunning():
@@ -1831,12 +2102,9 @@ class LanScannerWindow(QMainWindow):
             QMessageBox.critical(self, "Errore", "Nessun indirizzo IP valido nell'intervallo specificato.")
             return
 
-        if len(hosts) > 4096:
-            QMessageBox.critical(self, "Errore", "L'intervallo massimo consentito per singola scansione è di 4096 indirizzi IP.")
-            return
-
         self.add_recent_range(s0, s1)
         self.table.clear()
+        self._row_items: Dict[str, QTreeWidgetItem] = {}
         self.prog_bar.setMaximum(len(hosts))
         self.prog_bar.setValue(0)
 
@@ -1848,6 +2116,7 @@ class LanScannerWindow(QMainWindow):
         self.scan_worker.progress_updated.connect(self._on_scan_progress)
         self.scan_worker.initial_alive_found.connect(self._on_initial_alive)
         self.scan_worker.hostname_resolved.connect(self._on_hostname_resolved)
+        self.scan_worker.names_progress.connect(self._on_names_progress)
         self.scan_worker.scan_finished.connect(self._on_scan_finished)
         self.scan_worker.scan_interrupted.connect(self._on_scan_interrupted)
         self.scan_worker.scan_error.connect(self._on_scan_error)
@@ -1863,17 +2132,23 @@ class LanScannerWindow(QMainWindow):
         for r in rows:
             item = QTreeWidgetItem(self.table, list(r))
             item.setTextAlignment(1, Qt.AlignCenter)
+            self._row_items[r[0]] = item
+        self._apply_filter(self.txt_filter.text())
+        self.lbl_status_msg.setText(f"Trovati {len(rows)} host: risoluzione nomi in corso...")
 
     @Slot(str, str, str, str)
     def _on_hostname_resolved(self, ip: str, hostname: str, hint: str, note: str) -> None:
-        root = self.table.invisibleRootItem()
-        for i in range(root.childCount()):
-            item = root.child(i)
-            if item.text(0) == ip:
-                item.setText(4, hostname)
-                item.setText(5, hint)
-                item.setText(6, note)
-                break
+        item = self._row_items.get(ip)
+        if item is not None:
+            item.setText(4, hostname)
+            item.setText(5, hint)
+            item.setText(6, note)
+            # Il nome appena arrivato può far rientrare la riga nel filtro attivo
+            self._filter_item(item, self.txt_filter.text().strip().lower())
+
+    @Slot(int, int)
+    def _on_names_progress(self, done: int, total: int) -> None:
+        self.lbl_status_msg.setText(f"Risoluzione nomi (DNS, mDNS, UPnP): {done}/{total} host...")
 
     @Slot(int)
     def _on_scan_finished(self, total_alive: int) -> None:
@@ -1895,21 +2170,22 @@ class LanScannerWindow(QMainWindow):
         self.lbl_status_msg.setText("Errore durante la scansione.")
         QMessageBox.critical(self, "Errore Scansione", f"Si è verificato un errore: {err_msg}")
 
+    def closeEvent(self, event) -> None:
+        if self.scan_worker and self.scan_worker.isRunning():
+            self.scan_worker.stop()
+            self.scan_worker.wait(3000)
+        super().closeEvent(event)
+
     # --- FILTERING & CONTEXT MENU ---
+    def _filter_item(self, item: QTreeWidgetItem, query: str) -> None:
+        match = not query or any(query in item.text(c).lower() for c in range(item.columnCount()))
+        item.setHidden(not match)
+
     def _apply_filter(self, text: str) -> None:
         query = text.strip().lower()
         root = self.table.invisibleRootItem()
         for i in range(root.childCount()):
-            item = root.child(i)
-            match = False
-            if not query:
-                match = True
-            else:
-                for c in range(item.columnCount()):
-                    if query in item.text(c).lower():
-                        match = True
-                        break
-            item.setHidden(not match)
+            self._filter_item(root.child(i), query)
 
     def _show_context_menu(self, pos) -> None:
         item = self.table.itemAt(pos)
@@ -1946,13 +2222,13 @@ class LanScannerWindow(QMainWindow):
             menu.addSeparator()
 
             act_ping_cont = menu.addAction("📈 Monitor Latenza & Ping Continuo...")
-            act_ping_cont.triggered.connect(lambda: ContinuousPingDialog(ip, self).exec())
+            act_ping_cont.triggered.connect(lambda: _exec_dialog(ContinuousPingDialog(ip, self)))
 
             act_custom_p = menu.addAction("🎯 Scansione Porte Personalizzata...")
-            act_custom_p.triggered.connect(lambda: CustomPortScanDialog(ip, self).exec())
+            act_custom_p.triggered.connect(lambda: _exec_dialog(CustomPortScanDialog(ip, self)))
 
             act_trace = menu.addAction("🛤️ Visualizza Traceroute (Rotta IP)...")
-            act_trace.triggered.connect(lambda: TracerouteDialog(ip, self).exec())
+            act_trace.triggered.connect(lambda: _exec_dialog(TracerouteDialog(ip, self)))
 
             act_note = menu.addAction("✏️ Assegna / Modifica Nota Dispositivo...")
             act_note.triggered.connect(lambda: self._edit_note_item(item))
@@ -1973,7 +2249,7 @@ class LanScannerWindow(QMainWindow):
 
         menu.addSeparator()
         act_info = menu.addAction("ℹ️ Informazioni e Crediti")
-        act_info.triggered.connect(lambda: AboutDialog(self).exec())
+        act_info.triggered.connect(lambda: _exec_dialog(AboutDialog(self)))
 
         menu.exec(self.table.mapToGlobal(pos))
 
@@ -2021,7 +2297,7 @@ class LanScannerWindow(QMainWindow):
             QMessageBox.information(self, "Ping Continuo", "Seleziona una riga dalla tabella.")
             return
         ip = selected[0].text(0)
-        ContinuousPingDialog(ip, self).exec()
+        _exec_dialog(ContinuousPingDialog(ip, self))
 
     def _open_custom_port_scan_selected(self) -> None:
         selected = self.table.selectedItems()
@@ -2029,7 +2305,7 @@ class LanScannerWindow(QMainWindow):
             QMessageBox.information(self, "Port Scan", "Seleziona una riga dalla tabella.")
             return
         ip = selected[0].text(0)
-        CustomPortScanDialog(ip, self).exec()
+        _exec_dialog(CustomPortScanDialog(ip, self))
 
     def _open_traceroute_selected(self) -> None:
         selected = self.table.selectedItems()
@@ -2037,7 +2313,7 @@ class LanScannerWindow(QMainWindow):
             QMessageBox.information(self, "Traceroute", "Seleziona una riga dalla tabella.")
             return
         ip = selected[0].text(0)
-        TracerouteDialog(ip, self).exec()
+        _exec_dialog(TracerouteDialog(ip, self))
 
     def _edit_note_selected(self) -> None:
         selected = self.table.selectedItems()
@@ -2074,7 +2350,7 @@ class LanScannerWindow(QMainWindow):
     def _open_detail_item(self, item: QTreeWidgetItem) -> None:
         values = tuple(item.text(i) for i in range(item.columnCount()))
         if values:
-            DeviceDetailDialog(values[0], values, self).exec()
+            _exec_dialog(DeviceDetailDialog(values[0], values, self))
 
     def _copy_selection(self) -> None:
         selected = self.table.selectedItems()
@@ -2197,7 +2473,8 @@ class LanScannerWindow(QMainWindow):
             rows_html = []
             for idx, item in enumerate(items):
                 bg = "#ffffff" if idx % 2 == 0 else "#f8fafc"
-                cols = "".join(f"<td>{item.text(c)}</td>" for c in range(item.columnCount()))
+                # Hostname, banner UPnP e note arrivano dalla rete o dall'utente: vanno escapati
+                cols = "".join(f"<td>{html.escape(item.text(c))}</td>" for c in range(item.columnCount()))
                 rows_html.append(f"<tr style='background-color:{bg};'>{cols}</tr>")
 
             headers_html = "".join(f"<th>{h}</th>" for h in COL_HEADERS)
@@ -2264,26 +2541,26 @@ class LanScannerWindow(QMainWindow):
         printer = QPrinter(QPrinter.HighResolution)
         dialog = QPrintDialog(printer, self)
         if dialog.exec() == QPrintDialog.Accepted:
-            html = [
+            parts = [
                 f"<h2>{APP_NAME} — Report Scansione LAN</h2>",
                 f"<p><b>Data:</b> {time.strftime('%d/%m/%Y %H:%M')} | <b>Host Trovati:</b> {count}</p>",
                 "<table border='1' cellspacing='0' cellpadding='5' style='border-collapse:collapse; width:100%; font-family: Segoe UI, sans-serif;'>",
-                "tr bgcolor='#f1f5f9'>" + "".join(f"<th>{h}</th>" for h in COL_HEADERS) + "</tr>",
+                "<tr bgcolor='#f1f5f9'>" + "".join(f"<th>{h}</th>" for h in COL_HEADERS) + "</tr>",
             ]
 
             for i in range(count):
                 item = root.child(i)
                 bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
-                html.append(f"<tr bgcolor='{bg}'>")
+                parts.append(f"<tr bgcolor='{bg}'>")
                 for c in range(item.columnCount()):
-                    html.append(f"<td>{item.text(c)}</td>")
-                html.append("</tr>")
+                    parts.append(f"<td>{html.escape(item.text(c))}</td>")
+                parts.append("</tr>")
 
-            html.append("</table>")
-            html.append(f"<p><small>{APP_COMPANY} — Sviluppatore: {APP_DEVELOPER} ({WEBSITE_URL})</small></p>")
+            parts.append("</table>")
+            parts.append(f"<p><small>{APP_COMPANY} — Sviluppatore: {APP_DEVELOPER} ({WEBSITE_URL})</small></p>")
 
             doc = QTextEdit()
-            doc.setHtml("".join(html))
+            doc.setHtml("".join(parts))
             doc.print_(printer)
             self.lbl_status_msg.setText("Report inviato alla stampante.")
 
@@ -2310,7 +2587,7 @@ class LanScannerWindow(QMainWindow):
 
     def _on_update_found(self, tag_version: str, download_url: str, release_notes: str) -> None:
         self.lbl_status_msg.setText(f"Nuova versione disponibile: {tag_version}")
-        UpdateDialog(tag_version, download_url, release_notes, self).exec()
+        _exec_dialog(UpdateDialog(tag_version, download_url, release_notes, self))
 
     def _on_no_update(self, current_ver: str, manual: bool) -> None:
         self.lbl_status_msg.setText(f"{APP_NAME} v{current_ver} è aggiornato all'ultima versione.")
